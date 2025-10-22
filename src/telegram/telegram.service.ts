@@ -1,6 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
-import { MOVERS_TIMEFRAMES, MoversSnapshot } from '../binance/binance.service';
+import {
+  MOVERS_TIMEFRAMES,
+  AggregatedMoversEntry,
+  MoversResult,
+} from '../binance/binance.service';
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 
@@ -26,15 +30,13 @@ export class TelegramService {
     });
   }
 
-  async sendMoversReport(
-    snapshots: Record<string, MoversSnapshot>,
-  ): Promise<void> {
+  async sendMoversReport(report: MoversResult): Promise<void> {
     if (!this.client || !this.chatId) {
       return;
     }
 
     const timestamp = new Date();
-    const messages = this.buildMessages(timestamp, snapshots);
+    const messages = this.buildMessages(timestamp, report);
 
     for (const message of messages) {
       await this.sendMessage(message);
@@ -42,61 +44,34 @@ export class TelegramService {
     }
   }
 
-  private buildMessages(
-    timestamp: Date,
-    snapshots: Record<string, MoversSnapshot>,
-  ): string[] {
+  private buildMessages(timestamp: Date, report: MoversResult): string[] {
     const header = `币安合约异动更新\n${timestamp.toISOString()}`;
     const messages = [header];
-    const symbolChanges = this.collectSymbolChanges(snapshots);
+    const lines: string[] = [];
 
-    for (const { label } of MOVERS_TIMEFRAMES) {
-      const snapshot = snapshots[label];
-      if (!snapshot) {
-        continue;
-      }
+    if (report.aggregatedTop.length === 0) {
+      lines.push('暂无符合条件的合约。');
+    } else {
+      lines.push('综合得分前20（去重）如下：');
+      report.aggregatedTop.forEach((item, index) => {
+        lines.push(
+          this.formatAggregatedEntry(item, index + 1),
+        );
+      });
+    }
 
-      const lines: string[] = [];
-      const windowLabel = this.buildWindowLabel(
-        label,
-        snapshot.window?.start,
-        snapshot.window?.end,
-      );
-      lines.push(`=== ${windowLabel} ===`);
-
-      if (snapshot.topGainers.length === 0 && snapshot.topLosers.length === 0) {
-        lines.push('无数据');
-        messages.push(lines.join('\n'));
-        continue;
-      }
-
-      lines.push('涨幅榜：');
-      lines.push(
-        ...snapshot.topGainers.map((entry, index) =>
-          this.formatEntry(entry, index + 1, label, symbolChanges),
-        ),
-      );
-
-      lines.push('');
-      lines.push('跌幅榜：');
-      lines.push(
-        ...snapshot.topLosers.map((entry, index) =>
-          this.formatEntry(entry, index + 1, label, symbolChanges),
-        ),
-      );
-
-      messages.push(lines.join('\n'));
+    if (lines.length > 0) {
+      messages.push(lines.join('\n\n'));
     }
 
     return messages.flatMap((message) => this.splitMessage(message));
   }
 
-  private formatEntry(
-    entry: MoversSnapshot['topGainers'][number],
+  private formatAggregatedEntry(
+    aggregated: AggregatedMoversEntry,
     rank: number,
-    currentLabel: string,
-    symbolChanges: Map<string, Record<string, number>>,
   ): string {
+    const { entry, timeframe, changes, window } = aggregated;
     const change = this.formatSignedPercent(entry.changePercent);
     const flowPercent =
       entry.flowPercent !== undefined
@@ -125,20 +100,17 @@ export class TelegramService {
     ].join(' | ');
 
     const extraTimeframes = this.buildAdditionalTimeframesLine(
-      entry.symbol,
-      currentLabel,
-      symbolChanges,
+      timeframe,
+      changes,
     );
 
     return [
-      `${rank}. ${entry.symbol} ${change}`,
+      `${rank}. ${entry.symbol} (${timeframe} ${window.start}-${window.end}) ${change}`,
       `综合 ${finalScore} | 核心 ${coreScore} | 确认 ${confirmScore} | 流动性惩罚 ${liquidityPenalty}`,
       `${behaviour}`,
       `${confirmation} | 主动成交 ${flowPercent} ${flowLabel}`,
       extraTimeframes,
-    ]
-      .filter((line) => line.length > 0)
-      .join('\n');
+    ].filter((line) => line.length > 0).join('\n');
   }
 
   private splitMessage(text: string): string[] {
@@ -229,43 +201,16 @@ export class TelegramService {
     await new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
 
-  private collectSymbolChanges(
-    snapshots: Record<string, MoversSnapshot>,
-  ): Map<string, Record<string, number>> {
-    const symbolChanges = new Map<string, Record<string, number>>();
-
-    for (const { label } of MOVERS_TIMEFRAMES) {
-      const snapshot = snapshots[label];
-      if (!snapshot) {
-        continue;
-      }
-
-      for (const [symbol, change] of Object.entries(snapshot.changes ?? {})) {
-        const map = symbolChanges.get(symbol) ?? {};
-        map[label] = change;
-        symbolChanges.set(symbol, map);
-      }
-    }
-
-    return symbolChanges;
-  }
-
   private buildAdditionalTimeframesLine(
-    symbol: string,
     currentLabel: string,
-    symbolChanges: Map<string, Record<string, number>>,
+    changes: Record<string, number>,
   ): string {
-    const changeMap = symbolChanges.get(symbol);
-    if (!changeMap) {
-      return '';
-    }
-
     const segments: string[] = [];
     for (const { label } of MOVERS_TIMEFRAMES) {
       if (label === currentLabel) {
         continue;
       }
-      const value = changeMap[label];
+      const value = changes[label];
       segments.push(
         `${label} ${value !== undefined ? this.formatSignedPercent(value) : '暂无'}`,
       );

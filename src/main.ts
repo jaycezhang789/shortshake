@@ -40,11 +40,14 @@ async function bootstrap() {
 
       console.log(`\n[${new Date().toISOString()}] Refreshing movers data...`);
       const movers = await binanceService.getTopMovers();
-      for (const [label, snapshot] of Object.entries(movers)) {
+      for (const [label, snapshot] of Object.entries(movers.snapshots)) {
         console.log(
           `[${label}] 涨幅榜 ${snapshot.topGainers.length} 项 | 跌幅榜 ${snapshot.topLosers.length} 项`,
         );
       }
+      console.log(
+        `[综合排名] 已选取 ${movers.aggregatedTop.length} 个高分标的用于推送。`,
+      );
       await telegramService.sendMoversReport(movers);
       console.log(
         `[${new Date().toISOString()}] Movers report dispatched to Telegram.`,

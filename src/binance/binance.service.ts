@@ -51,6 +51,22 @@ export interface MoversSnapshot {
   };
 }
 
+export interface AggregatedMoversEntry {
+  symbol: string;
+  timeframe: string;
+  entry: MoversEntry;
+  changes: Record<string, number>;
+  window: {
+    start: string;
+    end: string;
+  };
+}
+
+export interface MoversResult {
+  snapshots: Record<string, MoversSnapshot>;
+  aggregatedTop: AggregatedMoversEntry[];
+}
+
 export interface MoversEntry {
   symbol: string;
   lastPrice: number;
@@ -115,12 +131,12 @@ export class BinanceService {
 
   constructor(private readonly http: HttpService) {}
 
-  async getTopMovers(): Promise<Record<string, MoversSnapshot>> {
+  async getTopMovers(): Promise<MoversResult> {
     this.logger.log('Starting top movers computation.');
     const volumeSelection = await this.getTopVolumeSymbols();
     if (volumeSelection.symbols.length === 0) {
       this.logger.warn('No symbols selected based on 24h quote volume.');
-      return {};
+      return { snapshots: {}, aggregatedTop: [] };
     }
 
     this.logger.log(
@@ -187,7 +203,7 @@ export class BinanceService {
 
     if (symbolDataList.length === 0) {
       this.logger.warn('No symbol data collected after batch processing.');
-      return {};
+      return { snapshots: {}, aggregatedTop: [] };
     }
 
     const volumeCollections: Record<string, number[]> = {};
@@ -353,8 +369,48 @@ export class BinanceService {
       );
     }
 
-    this.logger.log('Top movers computation completed.');
-    return result;
+    const aggregatedCandidates = new Map<string, AggregatedMoversEntry>();
+    for (const { label } of MOVERS_TIMEFRAMES) {
+      const entries = metricsByTimeframe[label];
+      const snapshotWindow = result[label]?.window ?? this.formatWindowTimes(undefined);
+      for (const entry of entries) {
+        const symbol = entry.symbol;
+        const existing = aggregatedCandidates.get(symbol);
+        if (existing && existing.entry.scores.final >= entry.scores.final) {
+          continue;
+        }
+
+        const symbolChanges: Record<string, number> = {};
+        for (const { label: changeLabel } of MOVERS_TIMEFRAMES) {
+          const changeValue = changeMaps[changeLabel]?.[symbol];
+          if (changeValue !== undefined) {
+            symbolChanges[changeLabel] = changeValue;
+          }
+        }
+
+        aggregatedCandidates.set(symbol, {
+          symbol,
+          timeframe: label,
+          entry,
+          changes: symbolChanges,
+          window: snapshotWindow,
+        });
+      }
+    }
+
+    const aggregatedTop = Array.from(aggregatedCandidates.values())
+      .sort(
+        (a, b) => b.entry.scores.final - a.entry.scores.final,
+      )
+      .slice(0, 20);
+
+    this.logger.log(
+      `Top movers computation completed. Aggregated symbols evaluated: ${aggregatedCandidates.size}.`,
+    );
+    return {
+      snapshots: result,
+      aggregatedTop,
+    };
   }
 
   private async getTopVolumeSymbols(): Promise<{
