@@ -4,7 +4,11 @@ import {
   MoversResult,
   SymbolTimeframeMetric,
 } from '../binance/binance.service';
-import { TradingService, PositionSummary } from './trading.service';
+import {
+  TradingService,
+  PositionSummary,
+  PriceTick,
+} from './trading.service';
 
 type PositionDirection = 'LONG' | 'SHORT';
 
@@ -40,6 +44,12 @@ interface ManagedPositionState {
   parentMinutes: number;
   childMinutes: number;
   maxR: number;
+  parentMetricSnapshot?: SymbolTimeframeMetric;
+  childMetricSnapshot?: SymbolTimeframeMetric;
+  unsubscribePrice?: () => void;
+  processingLiveUpdate: boolean;
+  pendingLiveUpdate?: PriceTick;
+  lastPrice?: number;
 }
 
 @Injectable()
@@ -91,18 +101,21 @@ export class StrategyService {
     for (const [symbol, state] of Array.from(this.managedPositions.entries())) {
       const summary = summaries.get(symbol);
       if (!summary) {
+        state.unsubscribePrice?.();
         this.managedPositions.delete(symbol);
         continue;
       }
 
       const quantity = this.extractQuantityForSide(summary, state.direction);
       if (quantity <= 1e-6) {
+        state.unsubscribePrice?.();
         this.managedPositions.delete(symbol);
         continue;
       }
 
       state.totalQuantity = quantity;
       state.riskAmount = quantity * state.slDistance;
+      this.ensurePriceWatcher(state);
     }
   }
 
@@ -240,9 +253,16 @@ export class StrategyService {
       parentMinutes: this.timeframeMinutes[parentTimeframe] ?? 60,
       childMinutes: this.timeframeMinutes[childTimeframe] ?? 10,
       maxR: 0,
+      parentMetricSnapshot: this.cloneMetric(parentMetric),
+      childMetricSnapshot: this.cloneMetric(childMetric),
+      processingLiveUpdate: false,
+      pendingLiveUpdate: undefined,
+      unsubscribePrice: undefined,
+      lastPrice: avgPrice,
     };
 
     this.managedPositions.set(candidate.symbol, state);
+    this.ensurePriceWatcher(state);
 
     this.logger.log(
       `Opened ${direction} on ${candidate.symbol} @ ${avgPrice.toFixed(
@@ -387,6 +407,10 @@ export class StrategyService {
       state.gateScore = childMetric.smallMoveGate ?? state.gateScore;
       state.childMinutes = this.timeframeMinutes[state.childTimeframe] ?? state.childMinutes;
       state.parentMinutes = this.timeframeMinutes[state.parentTimeframe] ?? state.parentMinutes;
+      state.parentMetricSnapshot = this.cloneMetric(parentMetric);
+      state.childMetricSnapshot = this.cloneMetric(childMetric);
+      state.lastPrice = currentPrice;
+      this.ensurePriceWatcher(state);
 
       if (state.direction === 'LONG') {
         state.highestPrice = Math.max(
@@ -428,7 +452,120 @@ export class StrategyService {
       await this.handleStructureBreak(state, childMetric);
 
       if (state.totalQuantity <= 1e-6) {
+        state.unsubscribePrice?.();
         this.managedPositions.delete(symbol);
+      }
+    }
+  }
+
+  private ensurePriceWatcher(state: ManagedPositionState): void {
+    if (state.totalQuantity <= 1e-6) {
+      state.unsubscribePrice?.();
+      state.unsubscribePrice = undefined;
+      return;
+    }
+    if (state.unsubscribePrice) {
+      return;
+    }
+    state.unsubscribePrice = this.tradingService.subscribePriceStream(
+      state.symbol,
+      (tick) => {
+        void this.handleLivePriceTick(state.symbol, tick);
+      },
+    );
+  }
+
+  private async handleLivePriceTick(
+    symbol: string,
+    tick: PriceTick,
+  ): Promise<void> {
+    const state = this.managedPositions.get(symbol);
+    if (!state || state.totalQuantity <= 1e-6) {
+      state?.unsubscribePrice?.();
+      return;
+    }
+
+    if (state.processingLiveUpdate) {
+      state.pendingLiveUpdate = tick;
+      return;
+    }
+
+    state.processingLiveUpdate = true;
+    state.pendingLiveUpdate = undefined;
+
+    try {
+      const parentMetricSnapshot = state.parentMetricSnapshot;
+      const childMetricSnapshot = state.childMetricSnapshot;
+      if (!parentMetricSnapshot || !childMetricSnapshot) {
+        return;
+      }
+
+      const currentPrice = tick.markPrice;
+      state.lastPrice = currentPrice;
+
+      if (state.direction === 'LONG') {
+        state.highestPrice = Math.max(
+          state.highestPrice ?? state.entryPrice,
+          currentPrice,
+        );
+      } else {
+        state.lowestPrice = Math.min(
+          state.lowestPrice ?? state.entryPrice,
+          currentPrice,
+        );
+      }
+
+      const liveParentMetric = this.withLivePrice(parentMetricSnapshot, currentPrice);
+      const liveChildMetric = this.withLivePrice(childMetricSnapshot, currentPrice);
+
+      const rMultiple = this.calculateRMultiple(state, currentPrice);
+      state.maxR = Math.max(state.maxR, rMultiple);
+
+      await this.handleBreakEvenMove(state, liveChildMetric, currentPrice);
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      await this.handleTrailingStop(
+        state,
+        liveParentMetric,
+        liveChildMetric,
+        currentPrice,
+      );
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      await this.handlePartials(state, liveChildMetric, currentPrice);
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      await this.handleAdds(state, liveChildMetric, currentPrice);
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      await this.handleTimeStop(state);
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      await this.handleStructureBreak(state, liveChildMetric);
+      if (!this.managedPositions.has(symbol)) {
+        return;
+      }
+
+      if (state.totalQuantity <= 1e-6) {
+        state.unsubscribePrice?.();
+        this.managedPositions.delete(symbol);
+      }
+    } finally {
+      state.processingLiveUpdate = false;
+      const pending = state.pendingLiveUpdate;
+      state.pendingLiveUpdate = undefined;
+      if (pending) {
+        void this.handleLivePriceTick(symbol, pending);
       }
     }
   }
@@ -463,6 +600,38 @@ export class StrategyService {
     }
 
     const dirSign = state.direction === 'LONG' ? 1 : -1;
+    let newStop = state.entryPrice;
+    if (state.direction === 'LONG') {
+      newStop = Math.min(newStop, currentPrice - 0.0005 * currentPrice);
+    } else {
+      newStop = Math.max(newStop, currentPrice + 0.0005 * currentPrice);
+    }
+
+    await this.tradingService.replaceStopLoss(
+      state.symbol,
+      state.direction,
+      state.totalQuantity,
+      newStop,
+    );
+
+    state.stopPrice = newStop;
+    state.slDistance = Math.abs(newStop - state.entryPrice);
+    state.beMoved = true;
+    state.riskAmount = state.totalQuantity * state.slDistance;
+  }
+
+  private async moveStopToBreakEven(
+    state: ManagedPositionState,
+    currentPrice: number,
+  ): Promise<void> {
+    if (
+      state.beMoved ||
+      state.slDistance <= 0 ||
+      state.totalQuantity <= 1e-6
+    ) {
+      return;
+    }
+
     let newStop = state.entryPrice;
     if (state.direction === 'LONG') {
       newStop = Math.min(newStop, currentPrice - 0.0005 * currentPrice);
@@ -558,13 +727,20 @@ export class StrategyService {
     const rMultiple = this.calculateRMultiple(state, currentPrice);
     const partialQty = Math.min(this.partialRatio * state.baseQuantity, state.totalQuantity);
 
-    if (
-      !state.partialOneTaken &&
-      ((cleanTrend && rMultiple >= 2) ||
-        (!cleanTrend && !strongVolume && rMultiple >= 1.5))
-    ) {
-      await this.executePartial(state, partialQty);
-      state.partialOneTaken = true;
+    if (!state.partialOneTaken) {
+      const triggeredCleanTrend = cleanTrend && rMultiple >= 2;
+      const triggeredGeneral =
+        !cleanTrend && !strongVolume && rMultiple >= 1.5;
+      if (triggeredCleanTrend || triggeredGeneral) {
+        await this.executePartial(state, partialQty);
+        if (!this.managedPositions.has(state.symbol)) {
+          return;
+        }
+        state.partialOneTaken = true;
+        if (triggeredGeneral) {
+          await this.moveStopToBreakEven(state, currentPrice);
+        }
+      }
     }
 
     if (!state.partialTwoTaken && !cleanTrend && rMultiple >= 2) {
@@ -726,6 +902,8 @@ export class StrategyService {
     state: ManagedPositionState,
     reason: string,
   ): Promise<void> {
+    state.unsubscribePrice?.();
+    state.unsubscribePrice = undefined;
     await this.tradingService.cancelAllOpenOrders(state.symbol);
     if (state.totalQuantity > 1e-6) {
       await this.tradingService.reducePosition(
@@ -749,10 +927,10 @@ export class StrategyService {
   }
 
   private isDegrading(series: number[]): boolean {
-    if (series.length < 4) {
+    if (series.length < 10) {
       return false;
     }
-    const last = series.slice(-4);
+    const last = series.slice(-10);
     for (let i = 1; i < last.length; i += 1) {
       if (last[i] > last[i - 1]) {
         return false;
@@ -772,6 +950,38 @@ export class StrategyService {
   private extractNumber(value: unknown): number {
     const num = Number(value);
     return Number.isFinite(num) ? num : 0;
+  }
+
+  private cloneMetric(metric: SymbolTimeframeMetric): SymbolTimeframeMetric {
+    return {
+      ...metric,
+      efficiencyHistory: [...(metric.efficiencyHistory ?? [])],
+      momentumHistory: [...(metric.momentumHistory ?? [])],
+      closeHistory: [...(metric.closeHistory ?? [])],
+    };
+  }
+
+  private withLivePrice(
+    metric: SymbolTimeframeMetric,
+    price: number,
+  ): SymbolTimeframeMetric {
+    const clone = this.cloneMetric(metric);
+    clone.latestClose = price;
+    clone.highestClose = Math.max(
+      clone.highestClose ?? price,
+      price,
+    );
+    clone.lowestClose = Math.min(
+      clone.lowestClose ?? price,
+      price,
+    );
+    const history = clone.closeHistory ?? [];
+    history.push(price);
+    if (history.length > 240) {
+      history.splice(0, history.length - 240);
+    }
+    clone.closeHistory = history;
+    return clone;
   }
 
   private clamp(value: number, min: number, max: number): number {

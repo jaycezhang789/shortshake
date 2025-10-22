@@ -1,10 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosInstance, Method } from 'axios';
 import * as crypto from 'crypto';
+import WebSocket, { CloseEvent, RawData } from 'ws';
 
 const BINANCE_BASE_URL = 'https://fapi.binance.com';
 const MAX_POSITIONS = 5;
 const DEFAULT_LEVERAGE = Number(process.env.BINANCE_LEVERAGE ?? 5);
+const FUTURES_STREAM_BASE = 'wss://fstream.binance.com/ws';
 
 export interface PositionSummary {
   symbol: string;
@@ -20,6 +22,22 @@ interface SymbolFilters {
   minNotional?: number;
   pricePrecision: number;
   quantityPrecision: number;
+}
+
+interface PriceStats {
+  symbol: string;
+  latest: number;
+  high: number;
+  low: number;
+  updatedAt: number;
+  openedAt: number;
+}
+
+export interface PriceTick {
+  symbol: string;
+  markPrice: number;
+  eventTime: number;
+  stats: PriceStats;
 }
 
 @Injectable()
@@ -44,6 +62,11 @@ export class TradingService {
   private exchangeInfoCache:
     | { expiresAt: number; filters: Map<string, SymbolFilters> }
     | null = null;
+
+  private readonly priceListeners = new Map<string, Set<(tick: PriceTick) => void>>();
+  private readonly priceStreams = new Map<string, WebSocket>();
+  private readonly priceStats = new Map<string, PriceStats>();
+  private readonly priceStreamReconnectTimers = new Map<string, NodeJS.Timeout>();
 
   constructor() {
     this.client = axios.create({
@@ -106,6 +129,179 @@ export class TradingService {
       return false;
     }
     return this.positions.size < MAX_POSITIONS;
+  }
+
+  subscribePriceStream(
+    symbol: string,
+    listener: (tick: PriceTick) => void,
+  ): () => void {
+    const key = symbol.toUpperCase();
+    let listeners = this.priceListeners.get(key);
+    if (!listeners) {
+      listeners = new Set();
+      this.priceListeners.set(key, listeners);
+      this.ensurePriceStream(key);
+    }
+
+    listeners.add(listener);
+
+    const stats = this.priceStats.get(key);
+    if (stats && Number.isFinite(stats.latest)) {
+      listener({
+        symbol: key,
+        markPrice: stats.latest,
+        eventTime: stats.updatedAt,
+        stats,
+      });
+    }
+
+    return () => {
+      const bucket = this.priceListeners.get(key);
+      if (!bucket) {
+        return;
+      }
+      bucket.delete(listener);
+      if (bucket.size === 0) {
+        this.priceListeners.delete(key);
+        this.teardownPriceStream(key);
+      }
+    };
+  }
+
+  getPriceStats(symbol: string): PriceStats | null {
+    return this.priceStats.get(symbol.toUpperCase()) ?? null;
+  }
+
+  private ensurePriceStream(symbol: string): void {
+    if (this.priceStreams.has(symbol)) {
+      return;
+    }
+
+    const streamSymbol = symbol.toLowerCase();
+    const endpoint = `${FUTURES_STREAM_BASE}/${streamSymbol}@markPrice@1s`;
+    this.logger.log(`Opening price stream for ${symbol} via ${endpoint}.`);
+
+    const socket = new WebSocket(endpoint);
+
+    socket.on('open', () => {
+      this.logger.log(`Price stream connected for ${symbol}.`);
+    });
+
+    socket.on('message', (raw) => {
+      this.handlePriceStreamPayload(symbol, raw);
+    });
+
+    socket.on('error', (error) => {
+      this.logger.warn(
+        `Price stream error for ${symbol}: ${(error as Error).message}`,
+      );
+    });
+
+    socket.on('close', (event: CloseEvent) => {
+      this.logger.warn(
+        `Price stream closed for ${symbol} (code=${event.code}, reason=${event.reason}).`,
+      );
+      this.priceStreams.delete(symbol);
+      const timer = this.priceStreamReconnectTimers.get(symbol);
+      if (timer) {
+        clearTimeout(timer);
+        this.priceStreamReconnectTimers.delete(symbol);
+      }
+      if (this.priceListeners.has(symbol)) {
+        const backoff = 2_000;
+        const reconnectTimer = setTimeout(() => {
+          this.logger.log(`Reconnecting price stream for ${symbol}.`);
+          this.ensurePriceStream(symbol);
+        }, backoff);
+        this.priceStreamReconnectTimers.set(symbol, reconnectTimer);
+      }
+    });
+
+    this.priceStreams.set(symbol, socket);
+  }
+
+  private teardownPriceStream(symbol: string): void {
+    const socket = this.priceStreams.get(symbol);
+    if (socket) {
+      socket.terminate();
+      this.priceStreams.delete(symbol);
+    }
+    const timer = this.priceStreamReconnectTimers.get(symbol);
+    if (timer) {
+      clearTimeout(timer);
+      this.priceStreamReconnectTimers.delete(symbol);
+    }
+    this.priceStats.delete(symbol);
+  }
+
+  private handlePriceStreamPayload(symbol: string, raw: RawData): void {
+    try {
+      const payload = JSON.parse(raw.toString());
+      const markPrice = parseFloat(payload.p ?? payload.markPrice ?? '0');
+      const eventTime = Number(payload.E ?? payload.eventTime ?? Date.now());
+      if (!Number.isFinite(markPrice) || markPrice <= 0) {
+        return;
+      }
+      const stats = this.updatePriceStats(symbol, markPrice, eventTime);
+      this.emitPriceTick(symbol, markPrice, eventTime, stats);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to parse price stream payload for ${symbol}: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  private emitPriceTick(
+    symbol: string,
+    markPrice: number,
+    eventTime: number,
+    stats: PriceStats,
+  ): void {
+    const listeners = this.priceListeners.get(symbol);
+    if (!listeners || listeners.size === 0) {
+      return;
+    }
+    const tick: PriceTick = {
+      symbol,
+      markPrice,
+      eventTime,
+      stats,
+    };
+    listeners.forEach((listener) => {
+      try {
+        listener(tick);
+      } catch (error) {
+        this.logger.warn(
+          `Price listener for ${symbol} threw error: ${(error as Error).message}`,
+        );
+      }
+    });
+  }
+
+  private updatePriceStats(
+    symbol: string,
+    price: number,
+    eventTime: number,
+  ): PriceStats {
+    const key = symbol.toUpperCase();
+    const existing = this.priceStats.get(key);
+    if (existing) {
+      existing.latest = price;
+      existing.updatedAt = eventTime;
+      existing.high = Math.max(existing.high, price);
+      existing.low = existing.low === 0 ? price : Math.min(existing.low, price);
+      return existing;
+    }
+    const stats: PriceStats = {
+      symbol: key,
+      latest: price,
+      high: price,
+      low: price,
+      updatedAt: eventTime,
+      openedAt: eventTime,
+    };
+    this.priceStats.set(key, stats);
+    return stats;
   }
 
   async initialize(): Promise<void> {
@@ -357,8 +553,71 @@ export class TradingService {
     quantity: number,
     stopPrice: number,
   ): Promise<void> {
-    await this.cancelAllOpenOrders(symbol);
+    await this.cancelExistingStopOrders(symbol, direction);
     await this.placeStopLoss(symbol, direction, quantity, stopPrice);
+  }
+
+  async placeTrailingTakeProfit(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+    quantity: number,
+    options: { callbackRate: number; activationPrice?: number },
+  ): Promise<any | null> {
+    if (!this.isTradingEnabled) {
+      return null;
+    }
+
+    try {
+      const filters = await this.getSymbolFilters(symbol);
+      const formattedQty = this.formatQuantity(
+        quantity,
+        filters.quantityPrecision,
+      );
+      const callbackRate = this.formatCallbackRate(options.callbackRate);
+      const side = direction === 'LONG' ? 'SELL' : 'BUY';
+
+      const payload: Record<string, any> = {
+        symbol,
+        side,
+        positionSide: direction,
+        type: 'TRAILING_STOP_MARKET',
+        quantity: formattedQty,
+        callbackRate,
+        workingType: 'MARK_PRICE',
+      };
+
+      if (
+        options.activationPrice &&
+        Number.isFinite(options.activationPrice) &&
+        options.activationPrice > 0
+      ) {
+        payload.activationPrice = this.formatPrice(
+          options.activationPrice,
+          filters.pricePrecision,
+        );
+      }
+
+      const response = await this.signedRequest(
+        'POST',
+        '/fapi/v1/order',
+        payload,
+      );
+      this.logger.log(
+        `Placed trailing take profit for ${symbol} (callbackRate=${callbackRate}).`,
+      );
+      return response;
+    } catch (error) {
+      this.logger.error(
+        `Failed to place trailing take profit for ${symbol}: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  private formatCallbackRate(raw: number): string {
+    const value = Number.isFinite(raw) ? raw : 1;
+    const bounded = Math.min(Math.max(value, 0.1), 5);
+    return bounded.toFixed(2);
   }
 
   private async ensureDualSidePosition(): Promise<void> {
@@ -522,6 +781,7 @@ export class TradingService {
     if (!Number.isFinite(price) || price <= 0) {
       throw new Error(`Invalid mark price received for ${symbol}`);
     }
+    this.updatePriceStats(symbol, price, Date.now());
     return price;
   }
 
@@ -699,6 +959,63 @@ export class TradingService {
     await this.marketOrderByQuantity(symbol, side, direction, quantity);
   }
 
+  private async cancelExistingStopOrders(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+  ): Promise<void> {
+    if (!this.isTradingEnabled) {
+      return;
+    }
+    try {
+      const openOrders = await this.signedRequest<any[]>(
+        'GET',
+        '/fapi/v1/openOrders',
+        { symbol },
+      );
+      const relevant = (openOrders ?? []).filter((order) => {
+        const positionSide = (order.positionSide ?? '').toUpperCase();
+        if (positionSide !== direction) {
+          return false;
+        }
+        const type = (order.type ?? '').toUpperCase();
+        const origType = (order.origType ?? '').toUpperCase();
+        return [
+          'STOP',
+          'STOP_MARKET',
+          'STOP_LOSS',
+          'TAKE_PROFIT',
+          'TAKE_PROFIT_MARKET',
+          'TRAILING_STOP_MARKET',
+        ].includes(type) || [
+          'STOP',
+          'STOP_MARKET',
+          'STOP_LOSS',
+        ].includes(origType);
+      });
+
+      for (const order of relevant) {
+        try {
+          await this.signedRequest('DELETE', '/fapi/v1/order', {
+            symbol,
+            orderId: order.orderId,
+            positionSide: direction,
+          });
+          this.logger.log(
+            `Cancelled existing stop order ${order.orderId} for ${symbol} (${direction}).`,
+          );
+        } catch (innerError) {
+          this.logger.warn(
+            `Failed to cancel stop order ${order.orderId} for ${symbol}: ${(innerError as Error).message}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Unable to fetch existing stop orders for ${symbol}: ${(error as Error).message}`,
+      );
+    }
+  }
+
   async cancelAllOpenOrders(symbol: string): Promise<void> {
     if (!this.isTradingEnabled) {
       return;
@@ -716,6 +1033,11 @@ export class TradingService {
   }
 
   async getMarkPrice(symbol: string): Promise<number> {
+    const stats = this.priceStats.get(symbol.toUpperCase());
+    const now = Date.now();
+    if (stats && Number.isFinite(stats.latest) && now - stats.updatedAt <= 2_000) {
+      return stats.latest;
+    }
     return this.fetchMarkPrice(symbol);
   }
 
