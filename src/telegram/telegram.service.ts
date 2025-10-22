@@ -47,7 +47,14 @@ export class TelegramService {
   async sendWalletSummary(
     balance: number,
     available: number,
-    positions: Array<{ symbol: string; net: number; long?: number; short?: number }>,
+    unrealized: number,
+    positions: Array<{
+      symbol: string;
+      net: number;
+      long?: number;
+      short?: number;
+      unrealizedPnl: number;
+    }>,
   ): Promise<void> {
     if (!this.client || !this.chatId) {
       return;
@@ -59,6 +66,7 @@ export class TelegramService {
       header,
       `总权益: ${balance.toFixed(2)} USDT`,
       `可用余额: ${available.toFixed(2)} USDT`,
+      `未实现盈亏: ${unrealized.toFixed(2)} USDT`,
       `持仓数量: ${positions.length}`,
     ];
 
@@ -66,7 +74,7 @@ export class TelegramService {
       const positionLines = positions.map((position) => {
         const longQty = position.long ?? 0;
         const shortQty = position.short ?? 0;
-        return `${position.symbol} | 净仓 ${position.net.toFixed(4)} | 多 ${longQty.toFixed(4)} | 空 ${shortQty.toFixed(4)}`;
+        return `${position.symbol} | 净仓 ${position.net.toFixed(4)} | 多 ${longQty.toFixed(4)} | 空 ${shortQty.toFixed(4)} | 浮盈 ${position.unrealizedPnl.toFixed(2)}`;
       });
       lines.push('持仓详情:');
       lines.push(...positionLines.slice(0, 15));

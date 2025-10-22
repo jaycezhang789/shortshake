@@ -76,6 +76,10 @@ export class TradingService {
     return this.availableBalance;
   }
 
+  getUnrealizedPnl(): number {
+    return this.unrealizedPnl;
+  }
+
   getActiveSymbols(): string[] {
     return Array.from(this.positions.keys());
   }
@@ -150,6 +154,8 @@ export class TradingService {
       `Trading state refreshed. Wallet: ${this.totalWalletBalance.toFixed(
         2,
       )} USDT, Available: ${this.availableBalance.toFixed(
+        2,
+      )} USDT, Unrealized PnL: ${this.unrealizedPnl.toFixed(
         2,
       )} USDT, Active symbols: ${this.positions.size}`,
     );
@@ -418,7 +424,10 @@ export class TradingService {
         map.get(symbol) ?? ({
           symbol,
           net: 0,
+          unrealizedPnl: 0,
         } as PositionSummary);
+      summary.unrealizedPnl = summary.unrealizedPnl ?? 0;
+      const unrealized = parseFloat(position.unRealizedProfit ?? '0');
 
       if (positionSide === 'LONG') {
         summary.long = positionAmt;
@@ -429,6 +438,7 @@ export class TradingService {
       }
 
       summary.net += positionAmt;
+      summary.unrealizedPnl += Number.isFinite(unrealized) ? unrealized : 0;
       map.set(symbol, summary);
     }
 

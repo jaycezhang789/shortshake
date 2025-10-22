@@ -58,6 +58,7 @@ async function bootstrap() {
         await telegramService.sendWalletSummary(
           tradingService.getWalletBalance(),
           tradingService.getAvailableBalance(),
+          tradingService.getUnrealizedPnl(),
           tradingService.getPositionSummaries(),
         );
         lastWalletReport = Date.now();
