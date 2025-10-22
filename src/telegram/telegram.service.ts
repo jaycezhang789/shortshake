@@ -57,7 +57,12 @@ export class TelegramService {
       }
 
       const lines: string[] = [];
-      lines.push(`=== ${label} 时间框 ===`);
+      const windowLabel = this.buildWindowLabel(
+        label,
+        snapshot.window?.start,
+        snapshot.window?.end,
+      );
+      lines.push(`=== ${windowLabel} ===`);
 
       if (snapshot.topGainers.length === 0 && snapshot.topLosers.length === 0) {
         lines.push('无数据');
@@ -190,6 +195,17 @@ export class TelegramService {
     }
     const formatted = this.formatNumber(Math.abs(value));
     return `${value >= 0 ? '+' : '-'}${formatted}%`;
+  }
+
+  private buildWindowLabel(
+    label: string,
+    start?: string,
+    end?: string,
+  ): string {
+    if (start && end) {
+      return `${label} 时间框（UTC+8 ${start}-${end}）`;
+    }
+    return `${label} 时间框`;
   }
 
   private formatScore(value: number | undefined): string {

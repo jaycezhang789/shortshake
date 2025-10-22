@@ -45,6 +45,10 @@ export interface MoversSnapshot {
   topGainers: MoversEntry[];
   topLosers: MoversEntry[];
   changes: Record<string, number>;
+  window: {
+    start: string;
+    end: string;
+  };
 }
 
 export interface MoversEntry {
@@ -90,11 +94,19 @@ interface SymbolTimeframeMetric {
   coreScore?: number;
   finalScore?: number;
   atrPct: number;
+  windowStart: number;
+  windowEnd: number;
 }
 
 @Injectable()
 export class BinanceService {
   private readonly logger = new Logger(BinanceService.name);
+  private readonly shanghaiTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Shanghai',
+  });
   private topVolumeCache:
     | { symbols: string[]; total: number; expiresAt: number }
     | null = null;
@@ -203,9 +215,14 @@ export class BinanceService {
 
     const metricsByTimeframe: Record<string, MoversEntry[]> = {};
     const changeMaps: Record<string, Record<string, number>> = {};
+    const windowMap: Record<
+      string,
+      { start: number; end: number } | undefined
+    > = {};
     for (const { label } of MOVERS_TIMEFRAMES) {
       metricsByTimeframe[label] = [];
       changeMaps[label] = {};
+      windowMap[label] = undefined;
     }
 
     for (const symbolData of symbolDataList) {
@@ -268,6 +285,11 @@ export class BinanceService {
 
         changeMaps[label][symbolData.symbol] = metric.changePercent;
 
+        windowMap[label] = this.mergeWindowTimes(
+          windowMap[label],
+          symbolData.metrics[label],
+        );
+
         metricsByTimeframe[label].push({
           symbol: symbolData.symbol,
           lastPrice: symbolData.lastPrice,
@@ -300,12 +322,14 @@ export class BinanceService {
     for (const { label } of MOVERS_TIMEFRAMES) {
       const entries = metricsByTimeframe[label];
       const changes = changeMaps[label] ?? {};
+      const window = this.formatWindowTimes(windowMap[label]);
       if (entries.length === 0) {
         result[label] = {
           timeframe: label,
           topGainers: [],
           topLosers: [],
           changes,
+          window,
         };
         continue;
       }
@@ -322,6 +346,7 @@ export class BinanceService {
         topGainers: sortedDesc.slice(0, TOP_MOVERS),
         topLosers: sortedAsc.slice(0, TOP_MOVERS),
         changes,
+        window,
       };
       this.logger.log(
         `Computed movers snapshot for timeframe ${label} (gainers: ${result[label].topGainers.length}, losers: ${result[label].topLosers.length}).`,
@@ -646,6 +671,8 @@ export class BinanceService {
         atrPct,
         flowImmediateBase,
         flowPersistence,
+        windowStart: first.openTime,
+        windowEnd: last.closeTime,
       };
     }
 
@@ -751,6 +778,49 @@ export class BinanceService {
 
       currentMetric.mtfConsistency = this.clamp(agree * mag, 0, 1);
     }
+  }
+
+  private mergeWindowTimes(
+    existing: { start: number; end: number } | undefined,
+    metric: SymbolTimeframeMetric | undefined,
+  ): { start: number; end: number } | undefined {
+    if (
+      !metric ||
+      !Number.isFinite(metric.windowStart) ||
+      !Number.isFinite(metric.windowEnd)
+    ) {
+      return existing;
+    }
+    if (!existing) {
+      return {
+        start: metric.windowStart,
+        end: metric.windowEnd,
+      };
+    }
+    return {
+      start: Math.min(existing.start, metric.windowStart),
+      end: Math.max(existing.end, metric.windowEnd),
+    };
+  }
+
+  private formatWindowTimes(
+    window: { start: number; end: number } | undefined,
+  ): { start: string; end: string } {
+    if (!window) {
+      const now = Date.now();
+      return {
+        start: this.formatTimestampUtc8(now),
+        end: this.formatTimestampUtc8(now),
+      };
+    }
+    return {
+      start: this.formatTimestampUtc8(window.start),
+      end: this.formatTimestampUtc8(window.end),
+    };
+  }
+
+  private formatTimestampUtc8(timestamp: number): string {
+    return this.shanghaiTimeFormatter.format(new Date(timestamp));
   }
 
   private computeVolumeStats(
