@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { BinanceService } from './binance/binance.service';
 import { TelegramService } from './telegram/telegram.service';
+import { TradingService } from './trading/trading.service';
 
 loadEnv();
 
@@ -12,8 +13,11 @@ async function bootstrap() {
   const intervalMs = intervalMinutes * 60 * 1000;
   const binanceService = app.get(BinanceService);
   const telegramService = app.get(TelegramService);
+  const tradingService = app.get(TradingService);
   let isRunning = false;
   let isShuttingDown = false;
+
+  await tradingService.initialize();
 
   const execute = async () => {
     if (isRunning) {
@@ -25,6 +29,8 @@ async function bootstrap() {
 
     isRunning = true;
     try {
+      await tradingService.refreshState();
+
       console.log(`\n[${new Date().toISOString()}] Refreshing movers data...`);
       const movers = await binanceService.getTopMovers();
       console.dir(movers, { depth: null });
