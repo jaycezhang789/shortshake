@@ -270,7 +270,6 @@ export class TradingService {
           quantity: formattedQty,
           timeInForce: 'GTC',
           workingType: 'CONTRACT_PRICE',
-          reduceOnly: 'true',
         },
       );
 
@@ -590,7 +589,6 @@ export class TradingService {
         positionSide,
         type: 'MARKET',
         quantity: formattedQty,
-        reduceOnly: 'true',
       });
 
       this.logger.log(
