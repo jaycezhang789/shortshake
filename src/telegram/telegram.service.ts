@@ -48,6 +48,7 @@ export class TelegramService {
   ): string[] {
     const header = `币安合约异动更新\n${timestamp.toISOString()}`;
     const messages = [header];
+    const symbolChanges = this.collectSymbolChanges(snapshots);
 
     for (const { label } of MOVERS_TIMEFRAMES) {
       const snapshot = snapshots[label];
@@ -67,7 +68,7 @@ export class TelegramService {
       lines.push('涨幅榜：');
       lines.push(
         ...snapshot.topGainers.map((entry, index) =>
-          this.formatEntry(entry, index + 1),
+          this.formatEntry(entry, index + 1, label, symbolChanges),
         ),
       );
 
@@ -75,7 +76,7 @@ export class TelegramService {
       lines.push('跌幅榜：');
       lines.push(
         ...snapshot.topLosers.map((entry, index) =>
-          this.formatEntry(entry, index + 1),
+          this.formatEntry(entry, index + 1, label, symbolChanges),
         ),
       );
 
@@ -88,6 +89,8 @@ export class TelegramService {
   private formatEntry(
     entry: MoversSnapshot['topGainers'][number],
     rank: number,
+    currentLabel: string,
+    symbolChanges: Map<string, Record<string, number>>,
   ): string {
     const change = this.formatSignedPercent(entry.changePercent);
     const flowPercent =
@@ -114,12 +117,21 @@ export class TelegramService {
       `流向 ${this.formatScore(scores.flowBoost)}`,
     ].join(' | ');
 
+    const extraTimeframes = this.buildAdditionalTimeframesLine(
+      entry.symbol,
+      currentLabel,
+      symbolChanges,
+    );
+
     return [
       `${rank}. ${entry.symbol} ${change}`,
       `综合 ${finalScore} | 核心 ${coreScore} | 确认 ${confirmScore} | 流动性惩罚 ${liquidityPenalty}`,
       `${behaviour}`,
       `${confirmation} | 主动成交 ${flowPercent} ${flowLabel}`,
-    ].join('\n');
+      extraTimeframes,
+    ]
+      .filter((line) => line.length > 0)
+      .join('\n');
   }
 
   private splitMessage(text: string): string[] {
@@ -197,5 +209,57 @@ export class TelegramService {
       return;
     }
     await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  private collectSymbolChanges(
+    snapshots: Record<string, MoversSnapshot>,
+  ): Map<string, Record<string, number>> {
+    const symbolChanges = new Map<string, Record<string, number>>();
+
+    for (const { label } of MOVERS_TIMEFRAMES) {
+      const snapshot = snapshots[label];
+      if (!snapshot) {
+        continue;
+      }
+
+      const record = (entry: MoversSnapshot['topGainers'][number]) => {
+        const map = symbolChanges.get(entry.symbol) ?? {};
+        map[label] = entry.changePercent;
+        symbolChanges.set(entry.symbol, map);
+      };
+
+      snapshot.topGainers.forEach(record);
+      snapshot.topLosers.forEach(record);
+    }
+
+    return symbolChanges;
+  }
+
+  private buildAdditionalTimeframesLine(
+    symbol: string,
+    currentLabel: string,
+    symbolChanges: Map<string, Record<string, number>>,
+  ): string {
+    const changeMap = symbolChanges.get(symbol);
+    if (!changeMap) {
+      return '';
+    }
+
+    const segments: string[] = [];
+    for (const { label } of MOVERS_TIMEFRAMES) {
+      if (label === currentLabel) {
+        continue;
+      }
+      const value = changeMap[label];
+      segments.push(
+        `${label} ${value !== undefined ? this.formatSignedPercent(value) : '暂无'}`,
+      );
+    }
+
+    if (segments.length === 0) {
+      return '';
+    }
+
+    return `其他周期：${segments.join(' | ')}`;
   }
 }

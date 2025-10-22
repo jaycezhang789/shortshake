@@ -40,7 +40,11 @@ async function bootstrap() {
 
       console.log(`\n[${new Date().toISOString()}] Refreshing movers data...`);
       const movers = await binanceService.getTopMovers();
-      console.dir(movers, { depth: null });
+      for (const [label, snapshot] of Object.entries(movers)) {
+        console.log(
+          `[${label}] 涨幅榜 ${snapshot.topGainers.length} 项 | 跌幅榜 ${snapshot.topLosers.length} 项`,
+        );
+      }
       await telegramService.sendMoversReport(movers);
       console.log(
         `[${new Date().toISOString()}] Movers report dispatched to Telegram.`,
