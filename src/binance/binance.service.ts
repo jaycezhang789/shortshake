@@ -66,6 +66,7 @@ export interface AggregatedMoversEntry {
 export interface MoversResult {
   snapshots: Record<string, MoversSnapshot>;
   aggregatedTop: AggregatedMoversEntry[];
+  metrics: Record<string, Record<string, SymbolTimeframeMetric>>;
 }
 
 export interface MoversEntry {
@@ -115,6 +116,14 @@ export interface SymbolTimeframeMetric {
   atrValue: number;
   windowStart: number;
   windowEnd: number;
+  highestClose: number;
+  lowestClose: number;
+  highestHigh: number;
+  lowestLow: number;
+  latestClose: number;
+  efficiencyHistory: number[];
+  momentumHistory: number[];
+  closeHistory: number[];
 }
 
 @Injectable()
@@ -139,7 +148,7 @@ export class BinanceService {
     const volumeSelection = await this.getTopVolumeSymbols();
     if (volumeSelection.symbols.length === 0) {
       this.logger.warn('No symbols selected based on 24h quote volume.');
-      return { snapshots: {}, aggregatedTop: [] };
+      return { snapshots: {}, aggregatedTop: [], metrics: {} };
     }
 
     this.logger.log(
@@ -206,7 +215,7 @@ export class BinanceService {
 
     if (symbolDataList.length === 0) {
       this.logger.warn('No symbol data collected after batch processing.');
-      return { snapshots: {}, aggregatedTop: [] };
+      return { snapshots: {}, aggregatedTop: [], metrics: {} };
     }
 
     const volumeCollections: Record<string, number[]> = {};
@@ -430,6 +439,14 @@ export class BinanceService {
     return {
       snapshots: result,
       aggregatedTop,
+      metrics: Object.fromEntries(
+        Array.from(symbolMetricsStore.entries()).map(([symbol, metricMap]) => [
+          symbol,
+          Object.fromEntries(
+            Object.entries(metricMap).map(([label, metric]) => [label, { ...metric }]),
+          ),
+        ]),
+      ),
     };
   }
 
@@ -733,6 +750,16 @@ export class BinanceService {
           ? this.squashedTanh((flowRatio - 0.5) / FLOW_SIGMA_K)
           : 0.5;
       const flowPersistence = this.computeFlowPersistence(flowSeries, returnSeries);
+      const closes = windowCandles.map((candle) => candle.close);
+      const highs = windowCandles.map((candle) => candle.high);
+      const lows = windowCandles.map((candle) => candle.low);
+      const highestClose = closes.length > 0 ? Math.max(...closes) : last.close;
+      const lowestClose = closes.length > 0 ? Math.min(...closes) : last.close;
+      const highestHigh = highs.length > 0 ? Math.max(...highs) : last.high;
+      const lowestLow = lows.length > 0 ? Math.min(...lows) : last.low;
+      const efficiencyHistory = this.computeEfficiencyHistory(windowCandles);
+      const momentumHistory = this.computeMomentumHistory(windowCandles);
+      const closeHistory = this.sampleCloseHistory(windowCandles);
 
       metrics[label] = {
         changePercent: net * 100,
@@ -750,6 +777,14 @@ export class BinanceService {
         flowPersistence,
         windowStart: first.openTime,
         windowEnd: last.closeTime,
+        highestClose,
+        lowestClose,
+        highestHigh,
+        lowestLow,
+        latestClose: last.close,
+        efficiencyHistory,
+        momentumHistory,
+        closeHistory,
       };
     }
 
@@ -1050,6 +1085,84 @@ export class BinanceService {
       sum += a[i] * b[i];
     }
     return this.clamp(sum / length, -1, 1);
+  }
+
+  private computeEfficiencyHistory(candles: Candle[]): number[] {
+    const history: number[] = [];
+    if (candles.length === 0) {
+      return history;
+    }
+    const segments = Math.min(10, candles.length);
+    const segmentSize = Math.max(1, Math.floor(candles.length / segments));
+
+    for (let end = candles.length; end > 0 && history.length < 10; end -= segmentSize) {
+      const start = Math.max(0, end - segmentSize);
+      const slice = candles.slice(start, end);
+      if (slice.length === 0) {
+        continue;
+      }
+      const first = slice[0];
+      const last = slice[slice.length - 1];
+      const net = (last.close - first.open) / first.open;
+      let sumAbs = 0;
+      for (const item of slice) {
+        sumAbs += Math.abs((item.close - item.open) / item.open);
+      }
+      const eff = sumAbs > 0 ? this.clamp(Math.abs(net) / sumAbs, 0, 1) : 0;
+      history.unshift(eff * 100);
+    }
+
+    return history.slice(-10);
+  }
+
+  private computeMomentumHistory(candles: Candle[]): number[] {
+    const history: number[] = [];
+    if (candles.length === 0) {
+      return history;
+    }
+    const segments = Math.min(10, candles.length);
+    const segmentSize = Math.max(1, Math.floor(candles.length / segments));
+
+    for (let end = candles.length; end > 0 && history.length < 10; end -= segmentSize) {
+      const start = Math.max(0, end - segmentSize);
+      const slice = candles.slice(start, end);
+      if (slice.length === 0) {
+        continue;
+      }
+      const first = slice[0];
+      const last = slice[slice.length - 1];
+      const net = (last.close - first.open) / first.open;
+      let trSum = 0;
+      let prevClose = first.open;
+      for (const item of slice) {
+        const highLow = item.high - item.low;
+        const highPrev = Math.abs(item.high - prevClose);
+        const lowPrev = Math.abs(item.low - prevClose);
+        trSum += Math.max(highLow, highPrev, lowPrev);
+        prevClose = item.close;
+      }
+      const atr = slice.length > 0 ? trSum / slice.length : 0;
+      const atrPct = last.close !== 0 ? atr / last.close : 0;
+      const momentum = atrPct > 0 ? this.clamp(Math.abs(net) / (atrPct * 2), 0, 1) : 0;
+      history.unshift(momentum * 100);
+    }
+
+    return history.slice(-10);
+  }
+
+  private sampleCloseHistory(candles: Candle[]): number[] {
+    if (candles.length === 0) {
+      return [];
+    }
+    const sample: number[] = [];
+    const step = Math.max(1, Math.floor(candles.length / 10));
+    for (let i = Math.max(0, candles.length - step * 10); i < candles.length; i += step) {
+      sample.push(candles[i].close);
+    }
+    if (sample[sample.length - 1] !== candles[candles.length - 1].close) {
+      sample.push(candles[candles.length - 1].close);
+    }
+    return sample.slice(-10);
   }
 
   private async requestWithRetry<T>(

@@ -6,7 +6,7 @@ const BINANCE_BASE_URL = 'https://fapi.binance.com';
 const MAX_POSITIONS = 5;
 const DEFAULT_LEVERAGE = Number(process.env.BINANCE_LEVERAGE ?? 5);
 
-interface PositionSummary {
+export interface PositionSummary {
   symbol: string;
   net: number;
   long?: number;
@@ -252,6 +252,59 @@ export class TradingService {
     }
   }
 
+  async marketOrderByQuantity(
+    symbol: string,
+    side: 'BUY' | 'SELL',
+    positionSide: 'LONG' | 'SHORT',
+    quantity: number,
+  ): Promise<any | null> {
+    if (!this.isTradingEnabled) {
+      return null;
+    }
+
+    const filters = await this.getSymbolFilters(symbol);
+    const markPrice = await this.fetchMarkPrice(symbol);
+
+    let adjustedQty = this.applyStepSize(quantity, filters.stepSize);
+    if (adjustedQty < filters.minQty) {
+      adjustedQty = filters.minQty;
+    }
+
+    if (adjustedQty <= 0) {
+      this.logger.warn(`Adjusted quantity invalid for ${symbol}.`);
+      return null;
+    }
+
+    const notional = adjustedQty * markPrice;
+    if (filters.minNotional && notional < filters.minNotional) {
+      adjustedQty = this.applyStepSize(
+        filters.minNotional / markPrice,
+        filters.stepSize,
+      );
+    }
+
+    const payload = {
+      symbol,
+      side,
+      positionSide,
+      type: 'MARKET',
+      quantity: this.formatQuantity(adjustedQty, filters.quantityPrecision),
+      newOrderRespType: 'RESULT',
+    };
+
+    try {
+      const response = await this.signedRequest('POST', '/fapi/v1/order', payload);
+      await this.refreshState();
+      this.logger.log(`Adjusted position ${symbol}, qty ${adjustedQty}.`);
+      return response;
+    } catch (error) {
+      this.logger.error(
+        `Failed to adjust position for ${symbol}: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  }
+
   async placeStopLoss(
     symbol: string,
     direction: 'LONG' | 'SHORT',
@@ -296,6 +349,16 @@ export class TradingService {
       );
       return null;
     }
+  }
+
+  async replaceStopLoss(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+    quantity: number,
+    stopPrice: number,
+  ): Promise<void> {
+    await this.cancelAllOpenOrders(symbol);
+    await this.placeStopLoss(symbol, direction, quantity, stopPrice);
   }
 
   private async ensureDualSidePosition(): Promise<void> {
@@ -616,6 +679,44 @@ export class TradingService {
         `Failed to flatten residual ${positionSide} position for ${symbol}: ${(error as Error).message}`,
       );
     }
+  }
+
+  async reducePosition(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+    quantity: number,
+  ): Promise<void> {
+    const side = direction === 'LONG' ? 'SELL' : 'BUY';
+    await this.marketOrderByQuantity(symbol, side, direction, quantity);
+  }
+
+  async increasePosition(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+    quantity: number,
+  ): Promise<void> {
+    const side = direction === 'LONG' ? 'BUY' : 'SELL';
+    await this.marketOrderByQuantity(symbol, side, direction, quantity);
+  }
+
+  async cancelAllOpenOrders(symbol: string): Promise<void> {
+    if (!this.isTradingEnabled) {
+      return;
+    }
+
+    try {
+      await this.signedRequest('DELETE', '/fapi/v1/allOpenOrders', {
+        symbol,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to cancel open orders for ${symbol}: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  async getMarkPrice(symbol: string): Promise<number> {
+    return this.fetchMarkPrice(symbol);
   }
 
   private async signedRequest<T>(
