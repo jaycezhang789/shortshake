@@ -222,14 +222,11 @@ export class TelegramService {
         continue;
       }
 
-      const record = (entry: MoversSnapshot['topGainers'][number]) => {
-        const map = symbolChanges.get(entry.symbol) ?? {};
-        map[label] = entry.changePercent;
-        symbolChanges.set(entry.symbol, map);
-      };
-
-      snapshot.topGainers.forEach(record);
-      snapshot.topLosers.forEach(record);
+      for (const [symbol, change] of Object.entries(snapshot.changes ?? {})) {
+        const map = symbolChanges.get(symbol) ?? {};
+        map[label] = change;
+        symbolChanges.set(symbol, map);
+      }
     }
 
     return symbolChanges;

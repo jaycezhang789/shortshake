@@ -42,6 +42,7 @@ export interface MoversSnapshot {
   timeframe: string;
   topGainers: MoversEntry[];
   topLosers: MoversEntry[];
+  changes: Record<string, number>;
 }
 
 export interface MoversEntry {
@@ -192,8 +193,10 @@ export class BinanceService {
     }
 
     const metricsByTimeframe: Record<string, MoversEntry[]> = {};
+    const changeMaps: Record<string, Record<string, number>> = {};
     for (const { label } of MOVERS_TIMEFRAMES) {
       metricsByTimeframe[label] = [];
+      changeMaps[label] = {};
     }
 
     for (const symbolData of symbolDataList) {
@@ -238,6 +241,8 @@ export class BinanceService {
         metric.confirmScore = confirmScore;
         metric.finalScore = finalScore;
 
+        changeMaps[label][symbolData.symbol] = metric.changePercent;
+
         metricsByTimeframe[label].push({
           symbol: symbolData.symbol,
           lastPrice: symbolData.lastPrice,
@@ -267,11 +272,13 @@ export class BinanceService {
     const result: Record<string, MoversSnapshot> = {};
     for (const { label } of MOVERS_TIMEFRAMES) {
       const entries = metricsByTimeframe[label];
+      const changes = changeMaps[label] ?? {};
       if (entries.length === 0) {
         result[label] = {
           timeframe: label,
           topGainers: [],
           topLosers: [],
+          changes,
         };
         continue;
       }
@@ -287,6 +294,7 @@ export class BinanceService {
         timeframe: label,
         topGainers: sortedDesc.slice(0, TOP_MOVERS),
         topLosers: sortedAsc.slice(0, TOP_MOVERS),
+        changes,
       };
       this.logger.log(
         `Computed movers snapshot for timeframe ${label} (gainers: ${result[label].topGainers.length}, losers: ${result[label].topLosers.length}).`,
