@@ -11,6 +11,7 @@ interface PositionSummary {
   net: number;
   long?: number;
   short?: number;
+  unrealizedPnl: number;
 }
 
 interface SymbolFilters {
@@ -35,6 +36,7 @@ export class TradingService {
 
   private totalWalletBalance = 0;
   private availableBalance = 0;
+  private unrealizedPnl = 0;
   private positions = new Map<string, PositionSummary>();
   private configuredSymbols = new Set<string>();
   private dualSideConfigured = false;
@@ -84,6 +86,7 @@ export class TradingService {
       net: summary.net,
       long: summary.long,
       short: summary.short,
+      unrealizedPnl: summary.unrealizedPnl,
     }));
   }
 
@@ -137,6 +140,10 @@ export class TradingService {
     ]);
 
     this.positions = positions;
+    this.unrealizedPnl = Array.from(positions.values()).reduce(
+      (sum, position) => sum + (position.unrealizedPnl ?? 0),
+      0,
+    );
     this.totalWalletBalance = balances.totalWalletBalance;
     this.availableBalance = balances.availableBalance;
     this.logger.log(
