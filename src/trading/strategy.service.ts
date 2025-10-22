@@ -63,8 +63,11 @@ export class StrategyService {
     '2h': 120,
   };
   private readonly partialRatio = 0.3;
+  private readonly kSlBuffer: number;
 
-  constructor(private readonly tradingService: TradingService) {}
+  constructor(private readonly tradingService: TradingService) {
+    this.kSlBuffer = this.computeKSlBuffer();
+  }
 
   async process(result: MoversResult): Promise<void> {
     if (!this.tradingService.isEnabled()) {
@@ -176,7 +179,14 @@ export class StrategyService {
       300;
     const gateChild = childMetric.smallMoveGate ?? 0;
 
-    const kSl = this.clamp(1.2 + 0.9 * cleanParent + 0.3 * gateChild, 1.2, 2.8);
+    const baseKSl = 1.2 + 0.9 * cleanParent + 0.3 * gateChild;
+    const minBuffered = 1.2 * this.kSlBuffer;
+    const maxBuffered = 2.8 * this.kSlBuffer;
+    const kSl = this.clamp(
+      baseKSl * this.kSlBuffer,
+      Math.min(minBuffered, maxBuffered),
+      Math.max(minBuffered, maxBuffered),
+    );
     const atrChild = childMetric.atrValue || 0;
     if (atrChild <= 0) {
       return;
@@ -927,10 +937,10 @@ export class StrategyService {
   }
 
   private isDegrading(series: number[]): boolean {
-    if (series.length < 10) {
+    if (series.length < 4) {
       return false;
     }
-    const last = series.slice(-10);
+    const last = series.slice(-4);
     for (let i = 1; i < last.length; i += 1) {
       if (last[i] > last[i - 1]) {
         return false;
@@ -982,6 +992,14 @@ export class StrategyService {
     }
     clone.closeHistory = history;
     return clone;
+  }
+
+  private computeKSlBuffer(): number {
+    const raw = Number(process.env.STRATEGY_KSL_BUFFER ?? 1);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return 1;
+    }
+    return this.clamp(raw, 0.5, 2);
   }
 
   private clamp(value: number, min: number, max: number): number {
