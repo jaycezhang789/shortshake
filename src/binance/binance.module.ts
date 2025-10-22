@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common';
 import { HttpModule } from '@nestjs/axios';
 import { BinanceService } from './binance.service';
-import { BinanceController } from './binance.controller';
 
 @Module({
   imports: [
@@ -11,7 +10,6 @@ import { BinanceController } from './binance.controller';
       maxRedirects: 0,
     }),
   ],
-  controllers: [BinanceController],
   providers: [BinanceService],
 })
 export class BinanceModule {}
