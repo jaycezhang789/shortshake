@@ -46,7 +46,7 @@ export class TelegramService {
     timestamp: Date,
     snapshots: Record<string, MoversSnapshot>,
   ): string[] {
-    const header = `Binance movers update\n${timestamp.toISOString()}`;
+    const header = `币安合约异动更新\n${timestamp.toISOString()}`;
     const messages = [header];
 
     for (const { label } of MOVERS_TIMEFRAMES) {
@@ -56,7 +56,7 @@ export class TelegramService {
       }
 
       const lines: string[] = [];
-      lines.push(`=== ${label} ===`);
+      lines.push(`=== ${label} 时间框 ===`);
 
       if (snapshot.topGainers.length === 0 && snapshot.topLosers.length === 0) {
         lines.push('无数据');
@@ -64,7 +64,7 @@ export class TelegramService {
         continue;
       }
 
-      lines.push('Top Gainers:');
+      lines.push('涨幅榜：');
       lines.push(
         ...snapshot.topGainers.map((entry, index) =>
           this.formatEntry(entry, index + 1),
@@ -72,7 +72,7 @@ export class TelegramService {
       );
 
       lines.push('');
-      lines.push('Top Losers:');
+      lines.push('跌幅榜：');
       lines.push(
         ...snapshot.topLosers.map((entry, index) =>
           this.formatEntry(entry, index + 1),
@@ -93,8 +93,8 @@ export class TelegramService {
     const flowPercent =
       entry.flowPercent !== undefined
         ? `${this.formatNumber(entry.flowPercent)}%`
-        : 'N/A';
-    const flowLabel = entry.flowLabel ?? '未知';
+        : '未知';
+    const flowLabel = entry.flowLabel ?? '流向未知';
     const scores = entry.scores;
     const finalScore = this.formatScore(scores.final);
     const coreScore = this.formatScore(scores.core);
@@ -102,23 +102,23 @@ export class TelegramService {
     const liquidityPenalty = this.formatScore(scores.liquidityPenalty);
 
     const behaviour = [
-      `Eff ${this.formatScore(scores.efficiency)}`,
-      `Chop ${this.formatScore(1 - scores.chop)}`,
-      `ATR ${this.formatScore(scores.momentumAtr)}`,
-      `Align ${this.formatScore(scores.align)}`,
-      `Gate ${this.formatScore(scores.gate)}`,
+      `效率 ${this.formatScore(scores.efficiency)}`,
+      `趋势 ${this.formatScore(1 - scores.chop)}`,
+      `动量 ${this.formatScore(scores.momentumAtr)}`,
+      `同向 ${this.formatScore(scores.align)}`,
+      `门槛 ${this.formatScore(scores.gate)}`,
     ].join(' | ');
 
     const confirmation = [
-      `Vol ${this.formatScore(scores.volumeBoost)}`,
-      `Flow ${this.formatScore(scores.flowBoost)}`,
+      `量能 ${this.formatScore(scores.volumeBoost)}`,
+      `流向 ${this.formatScore(scores.flowBoost)}`,
     ].join(' | ');
 
     return [
       `${rank}. ${entry.symbol} ${change}`,
-      `Final ${finalScore} | Core ${coreScore} | Confirm ${confirmScore} | LiqPenalty ${liquidityPenalty}`,
+      `综合 ${finalScore} | 核心 ${coreScore} | 确认 ${confirmScore} | 流动性惩罚 ${liquidityPenalty}`,
       `${behaviour}`,
-      `${confirmation} | Flow ${flowPercent} ${flowLabel}`,
+      `${confirmation} | 主动成交 ${flowPercent} ${flowLabel}`,
     ].join('\n');
   }
 
@@ -172,7 +172,7 @@ export class TelegramService {
 
   private formatSignedPercent(value: number): string {
     if (!Number.isFinite(value)) {
-      return 'N/A';
+      return '未知';
     }
     const formatted = this.formatNumber(Math.abs(value));
     return `${value >= 0 ? '+' : '-'}${formatted}%`;
@@ -180,14 +180,14 @@ export class TelegramService {
 
   private formatScore(value: number | undefined): string {
     if (!Number.isFinite(value ?? NaN)) {
-      return 'N/A';
+      return '未知';
     }
     return this.formatNumber((value ?? 0) * 100);
   }
 
   private formatNumber(value: number): string {
     if (!Number.isFinite(value)) {
-      return 'N/A';
+      return '未知';
     }
     return value.toFixed(2);
   }

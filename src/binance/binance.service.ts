@@ -24,7 +24,6 @@ const FLOW_BUY_THRESHOLD = 0.62;
 const FLOW_SELL_THRESHOLD = 0.38;
 const MAX_SELECTED_SYMBOLS = 80;
 const CHG_SMALL = 0.01;
-const SLIPPAGE_TARGET_QUOTE = 10_000;
 const STATS_EPSILON = 1e-9;
 
 interface Candle {
@@ -96,6 +95,7 @@ export class BinanceService {
   constructor(private readonly http: HttpService) {}
 
   async getTopMovers(): Promise<Record<string, MoversSnapshot>> {
+    this.logger.log('Starting top movers computation.');
     const volumeSelection = await this.getTopVolumeSymbols();
     if (volumeSelection.symbols.length === 0) {
       this.logger.warn('No symbols selected based on 24h quote volume.');
@@ -104,6 +104,9 @@ export class BinanceService {
 
     this.logger.log(
       `Selected ${volumeSelection.symbols.length} symbols from ${volumeSelection.total} tradable contracts.`,
+    );
+    this.logger.log(
+      `Processing symbols in batches of ${CONCURRENCY}.`,
     );
 
     const symbolDataList: Array<{
@@ -154,9 +157,15 @@ export class BinanceService {
         }
         symbolDataList.push(item);
       }
+
+      const processedCount = symbolDataList.length;
+      this.logger.log(
+        `Processed ${processedCount}/${volumeSelection.symbols.length} symbols so far.`,
+      );
     }
 
     if (symbolDataList.length === 0) {
+      this.logger.warn('No symbol data collected after batch processing.');
       return {};
     }
 
@@ -175,6 +184,7 @@ export class BinanceService {
       }
     }
 
+    this.logger.log('Calculating volume statistics for each timeframe.');
     const volumeStats = this.computeVolumeStats(volumeCollections);
 
     for (const symbolData of symbolDataList) {
@@ -278,8 +288,12 @@ export class BinanceService {
         topGainers: sortedDesc.slice(0, TOP_MOVERS),
         topLosers: sortedAsc.slice(0, TOP_MOVERS),
       };
+      this.logger.log(
+        `Computed movers snapshot for timeframe ${label} (gainers: ${result[label].topGainers.length}, losers: ${result[label].topLosers.length}).`,
+      );
     }
 
+    this.logger.log('Top movers computation completed.');
     return result;
   }
 
@@ -289,6 +303,9 @@ export class BinanceService {
   }> {
     const now = Date.now();
     if (this.topVolumeCache && this.topVolumeCache.expiresAt > now) {
+      this.logger.log(
+        'Using cached 24h volume selection for symbol universe.',
+      );
       return {
         symbols: this.topVolumeCache.symbols,
         total: this.topVolumeCache.total,
@@ -327,6 +344,10 @@ export class BinanceService {
       total,
       expiresAt: now + VOLUME_REFRESH_INTERVAL,
     };
+
+    this.logger.log(
+      `Refreshed 24h volume selection -> selected ${selectedSymbols.length}/${total} symbols.`,
+    );
 
     return {
       symbols: selectedSymbols,
@@ -647,161 +668,7 @@ export class BinanceService {
   private async fetchLiquidityMetrics(
     symbol: string,
   ): Promise<{ spreadBps: number; slippageBps: number; penalty: number } | null> {
-    try {
-      const [tickerResponse, depthResponse] = await Promise.all([
-        this.requestWithRetry(
-          () =>
-            firstValueFrom(
-              this.http.get<{ bidPrice: string; askPrice: string }>(
-                '/fapi/v1/ticker/bookTicker',
-                { params: { symbol } },
-              ),
-            ),
-          `bookTicker:${symbol}`,
-        ),
-        this.requestWithRetry(
-          () =>
-            firstValueFrom(
-              this.http.get<{ bids: string[][]; asks: string[][] }>(
-                '/fapi/v1/depth',
-                { params: { symbol, limit: 200 } },
-              ),
-            ),
-          `depth:${symbol}`,
-        ),
-      ]);
-
-      const ticker = tickerResponse.data;
-      const depth = depthResponse.data;
-
-      const bestBid = parseFloat(ticker?.bidPrice ?? '0');
-      const bestAsk = parseFloat(ticker?.askPrice ?? '0');
-      if (
-        !Number.isFinite(bestBid) ||
-        !Number.isFinite(bestAsk) ||
-        bestBid <= 0 ||
-        bestAsk <= 0 ||
-        bestAsk <= bestBid
-      ) {
-        return null;
-      }
-
-      const mid = (bestBid + bestAsk) / 2;
-      if (!Number.isFinite(mid) || mid <= 0) {
-        return null;
-      }
-
-      const spreadBps = this.clamp(
-        ((bestAsk - bestBid) / mid) * 10_000,
-        0,
-        Number.POSITIVE_INFINITY,
-      );
-
-      const slippageBps = this.calculateSlippageBps(depth, mid);
-      if (!Number.isFinite(slippageBps)) {
-        return {
-          spreadBps,
-          slippageBps: spreadBps,
-          penalty: this.clamp((spreadBps / 10) * 0.6 + 0.4, 0, 1),
-        };
-      }
-
-      const penalty =
-        this.clamp(spreadBps / 10, 0, 1) * 0.6 +
-        this.clamp(slippageBps / 20, 0, 1) * 0.4;
-
-      return {
-        spreadBps,
-        slippageBps,
-        penalty: this.clamp(penalty, 0, 1),
-      };
-    } catch (error) {
-      this.logger.debug(
-        `Liquidity fetch failed for ${symbol}: ${(error as Error).message}`,
-      );
-      return null;
-    }
-  }
-
-  private calculateSlippageBps(
-    depth: { bids?: string[][]; asks?: string[][] } | undefined,
-    mid: number,
-  ): number {
-    const asks = Array.isArray(depth?.asks) ? depth?.asks : [];
-    const bids = Array.isArray(depth?.bids) ? depth?.bids : [];
-
-    const buyAverage = this.computeAverageFillPrice(asks, SLIPPAGE_TARGET_QUOTE);
-    const sellAverage = this.computeAverageFillPrice(
-      bids,
-      SLIPPAGE_TARGET_QUOTE,
-    );
-
-    const slips: number[] = [];
-
-    if (buyAverage !== null) {
-      slips.push(
-        this.clamp(((buyAverage - mid) / mid) * 10_000, 0, Number.POSITIVE_INFINITY),
-      );
-    }
-
-    if (sellAverage !== null) {
-      slips.push(
-        this.clamp(((mid - sellAverage) / mid) * 10_000, 0, Number.POSITIVE_INFINITY),
-      );
-    }
-
-    if (slips.length === 0) {
-      return Number.NaN;
-    }
-
-    return Math.max(...slips);
-  }
-
-  private computeAverageFillPrice(
-    levels: string[][],
-    targetQuote: number,
-  ): number | null {
-    if (!Array.isArray(levels) || levels.length === 0 || targetQuote <= 0) {
-      return null;
-    }
-
-    let remainingQuote = targetQuote;
-    let accumulatedQuote = 0;
-    let accumulatedBase = 0;
-
-    for (const level of levels) {
-      if (!Array.isArray(level) || level.length < 2) {
-        continue;
-      }
-      const price = parseFloat(level[0] ?? '0');
-      const quantity = parseFloat(level[1] ?? '0');
-      if (
-        !Number.isFinite(price) ||
-        !Number.isFinite(quantity) ||
-        price <= 0 ||
-        quantity <= 0
-      ) {
-        continue;
-      }
-
-      const levelQuote = price * quantity;
-      const usedQuote = Math.min(levelQuote, remainingQuote);
-      const usedBase = usedQuote / price;
-
-      accumulatedQuote += usedQuote;
-      accumulatedBase += usedBase;
-      remainingQuote -= usedQuote;
-
-      if (remainingQuote <= 0) {
-        break;
-      }
-    }
-
-    if (accumulatedBase <= 0 || remainingQuote > targetQuote * 0.05) {
-      return null;
-    }
-
-    return accumulatedQuote / accumulatedBase;
+    return null;
   }
 
   private classifyFlow(ratio: number): string {

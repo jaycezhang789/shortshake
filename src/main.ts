@@ -8,6 +8,7 @@ import { TradingService } from './trading/trading.service';
 loadEnv();
 
 async function bootstrap() {
+  console.log('Bootstrapping application context...');
   const app = await NestFactory.createApplicationContext(AppModule);
   const intervalMinutes = Number(process.env.REFRESH_INTERVAL_MINUTES) || 10;
   const intervalMs = intervalMinutes * 60 * 1000;
@@ -17,7 +18,9 @@ async function bootstrap() {
   let isRunning = false;
   let isShuttingDown = false;
 
+  console.log('Initializing trading service state...');
   await tradingService.initialize();
+  console.log('Trading service initialization complete.');
 
   const execute = async () => {
     if (isRunning) {
@@ -29,16 +32,26 @@ async function bootstrap() {
 
     isRunning = true;
     try {
+      console.log(`[${new Date().toISOString()}] Starting refresh cycle...`);
       await tradingService.refreshState();
+      console.log(
+        `[${new Date().toISOString()}] Trading service state refreshed.`,
+      );
 
       console.log(`\n[${new Date().toISOString()}] Refreshing movers data...`);
       const movers = await binanceService.getTopMovers();
       console.dir(movers, { depth: null });
       await telegramService.sendMoversReport(movers);
+      console.log(
+        `[${new Date().toISOString()}] Movers report dispatched to Telegram.`,
+      );
     } catch (error) {
       console.error('Main process failed:', error);
     } finally {
       isRunning = false;
+      console.log(
+        `[${new Date().toISOString()}] Refresh cycle finished. Awaiting next run.`,
+      );
     }
   };
 
@@ -53,8 +66,10 @@ async function bootstrap() {
     }
     isShuttingDown = true;
     console.log(`\nReceived ${signal}, shutting down...`);
+    console.log('Clearing timers and closing Nest application context...');
     clearInterval(timer);
     await app.close();
+    console.log('Shutdown sequence complete. Exiting process.');
     process.exit(0);
   };
 

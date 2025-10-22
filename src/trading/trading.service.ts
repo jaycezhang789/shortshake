@@ -97,8 +97,12 @@ export class TradingService {
       return;
     }
 
+    this.logger.log('Starting trading service initialization sequence.');
     try {
       await this.ensureDualSidePosition();
+      this.logger.log(
+        `Dual-side position mode status: ${this.dualSideConfigured ? 'enabled' : 'unable to confirm'}.`,
+      );
       await this.refreshState();
       this.logger.log(
         `Initialized trading state. Wallet balance: ${this.totalWalletBalance.toFixed(
@@ -117,6 +121,7 @@ export class TradingService {
       return;
     }
 
+    this.logger.log('Refreshing trading state from Binance.');
     const [balances, positions] = await Promise.all([
       this.fetchFuturesBalances(),
       this.fetchOpenPositions(),
@@ -125,6 +130,13 @@ export class TradingService {
     this.positions = positions;
     this.totalWalletBalance = balances.totalWalletBalance;
     this.availableBalance = balances.availableBalance;
+    this.logger.log(
+      `Trading state refreshed. Wallet: ${this.totalWalletBalance.toFixed(
+        2,
+      )} USDT, Available: ${this.availableBalance.toFixed(
+        2,
+      )} USDT, Active symbols: ${this.positions.size}`,
+    );
   }
 
   async createMarketOrder(
@@ -143,7 +155,13 @@ export class TradingService {
       return null;
     }
 
+    this.logger.log(
+      `Preparing ${direction} market order for ${symbol}.`,
+    );
     const markPrice = await this.fetchMarkPrice(symbol);
+    this.logger.log(
+      `Mark price for ${symbol}: ${markPrice}.`,
+    );
     const filters = await this.getSymbolFilters(symbol);
     await this.ensureSymbolConfiguration(symbol);
 
@@ -171,6 +189,11 @@ export class TradingService {
       return null;
     }
 
+    this.logger.log(
+      `Calculated order quantity for ${symbol}: ${quantity} (notional ≈ ${(quantity * markPrice).toFixed(
+        filters.pricePrecision,
+      )} USDT).`,
+    );
     const side = direction === 'LONG' ? 'BUY' : 'SELL';
     const positionSide = direction;
 
@@ -184,6 +207,9 @@ export class TradingService {
     };
 
     try {
+      this.logger.log(
+        `Sending market order request for ${symbol}: ${JSON.stringify(payload)}.`,
+      );
       const response = await this.signedRequest(
         'POST',
         '/fapi/v1/order',
@@ -207,12 +233,14 @@ export class TradingService {
       return;
     }
 
+    this.logger.log('Verifying dual-side position configuration.');
     try {
       const status = await this.signedRequest<{ dualSidePosition: boolean }>(
         'GET',
         '/fapi/v1/positionSide/dual',
       );
       if (!status.dualSidePosition) {
+        this.logger.log('Dual-side mode disabled. Enabling now.');
         await this.signedRequest('POST', '/fapi/v1/positionSide/dual', {
           dualSidePosition: 'true',
         });
@@ -240,6 +268,7 @@ export class TradingService {
       return;
     }
 
+    this.logger.log(`Ensuring symbol configuration for ${symbol}.`);
     try {
       await this.signedRequest('POST', '/fapi/v1/marginType', {
         symbol,
@@ -266,6 +295,9 @@ export class TradingService {
     }
 
     this.configuredSymbols.add(symbol);
+    this.logger.log(
+      `Symbol ${symbol} configuration ensured (margin type + leverage).`,
+    );
   }
 
   private async fetchFuturesBalances(): Promise<{
@@ -288,6 +320,11 @@ export class TradingService {
       }
     }
 
+    this.logger.log(
+      `Fetched USDT futures balances -> total: ${totalWalletBalance.toFixed(
+        2,
+      )}, available: ${availableBalance.toFixed(2)}.`,
+    );
     return {
       totalWalletBalance,
       availableBalance,
@@ -331,6 +368,9 @@ export class TradingService {
       map.set(symbol, summary);
     }
 
+    this.logger.log(
+      `Fetched ${map.size} active position summaries.`,
+    );
     return map;
   }
 
@@ -355,9 +395,11 @@ export class TradingService {
       this.exchangeInfoCache.expiresAt > now &&
       this.exchangeInfoCache.filters.has(symbol)
     ) {
+      this.logger.log(`Using cached exchange filters for ${symbol}.`);
       return this.exchangeInfoCache.filters.get(symbol) as SymbolFilters;
     }
 
+    this.logger.log('Refreshing exchange filters from Binance.');
     const response = await this.publicClient.get<{
       symbols: Array<{
         symbol: string;
@@ -404,6 +446,9 @@ export class TradingService {
       expiresAt: now + 30 * 60 * 1000,
     };
 
+    this.logger.log(
+      `Exchange filters refreshed. Cached ${filtersMap.size} symbols.`,
+    );
     const filters = filtersMap.get(symbol);
     if (!filters) {
       throw new Error(`Symbol filters not found for ${symbol}`);
@@ -459,6 +504,7 @@ export class TradingService {
 
     const url = `${path}?${query.toString()}`;
 
+    this.logger.log(`Dispatching signed request ${method} ${path}.`);
     const response = await this.client.request<T>({
       url,
       method,
