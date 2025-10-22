@@ -4,6 +4,7 @@ import { AppModule } from './app.module';
 import { BinanceService } from './binance/binance.service';
 import { TelegramService } from './telegram/telegram.service';
 import { TradingService } from './trading/trading.service';
+import { StrategyService } from './trading/strategy.service';
 
 loadEnv();
 
@@ -15,6 +16,9 @@ async function bootstrap() {
   const binanceService = app.get(BinanceService);
   const telegramService = app.get(TelegramService);
   const tradingService = app.get(TradingService);
+  const strategyService = app.get(StrategyService);
+  let lastWalletReport = 0;
+  const walletReportIntervalMs = 10 * 60 * 1000;
   let isRunning = false;
   let isShuttingDown = false;
 
@@ -48,7 +52,16 @@ async function bootstrap() {
       console.log(
         `[综合排名] 已选取 ${movers.aggregatedTop.length} 个高分标的用于推送。`,
       );
+      await strategyService.process(movers);
       await telegramService.sendMoversReport(movers);
+      if (Date.now() - lastWalletReport >= walletReportIntervalMs) {
+        await telegramService.sendWalletSummary(
+          tradingService.getWalletBalance(),
+          tradingService.getAvailableBalance(),
+          tradingService.getPositionSummaries(),
+        );
+        lastWalletReport = Date.now();
+      }
       console.log(
         `[${new Date().toISOString()}] Movers report dispatched to Telegram.`,
       );

@@ -60,6 +60,7 @@ export interface AggregatedMoversEntry {
     start: string;
     end: string;
   };
+  metrics: Record<string, SymbolTimeframeMetric>;
 }
 
 export interface MoversResult {
@@ -90,7 +91,7 @@ export interface MoversEntry {
   };
 }
 
-interface SymbolTimeframeMetric {
+export interface SymbolTimeframeMetric {
   changePercent: number;
   netChange: number;
   efficiency: number;
@@ -106,10 +107,12 @@ interface SymbolTimeframeMetric {
   flowPersistence?: number;
   mtfConsistency?: number;
   activeFlow?: number;
+  flowBoost?: number;
   confirmScore?: number;
   coreScore?: number;
   finalScore?: number;
   atrPct: number;
+  atrValue: number;
   windowStart: number;
   windowEnd: number;
 }
@@ -235,6 +238,10 @@ export class BinanceService {
       string,
       { start: number; end: number } | undefined
     > = {};
+    const symbolMetricsStore = new Map<
+      string,
+      Record<string, SymbolTimeframeMetric>
+    >();
     for (const { label } of MOVERS_TIMEFRAMES) {
       metricsByTimeframe[label] = [];
       changeMaps[label] = {};
@@ -266,6 +273,13 @@ export class BinanceService {
         const mtfConsistency = this.clamp(metric.mtfConsistency ?? 0.5, 0, 1);
         const align = this.clamp(metric.align ?? 0.5, 0, 1);
 
+        metric.volumeBoost = volBoost;
+        metric.activeFlow = activeFlow;
+        metric.flowBoost = activeFlow;
+        metric.flowPersistence = flowPersistence;
+        metric.mtfConsistency = mtfConsistency;
+        metric.align = align;
+
         const coreScore =
           metric.smallMoveGate *
           this.weightedAverage([
@@ -290,14 +304,13 @@ export class BinanceService {
           1,
         );
 
-        metric.volumeBoost = volBoost;
-        metric.activeFlow = activeFlow;
-        metric.flowPersistence = flowPersistence;
-        metric.mtfConsistency = mtfConsistency;
-        metric.align = align;
         metric.coreScore = coreScore;
         metric.confirmScore = confirmScore;
         metric.finalScore = finalScore;
+
+        const symbolMetrics = symbolMetricsStore.get(symbolData.symbol) ?? {};
+        symbolMetrics[label] = { ...metric };
+        symbolMetricsStore.set(symbolData.symbol, symbolMetrics);
 
         changeMaps[label][symbolData.symbol] = metric.changePercent;
 
@@ -388,12 +401,19 @@ export class BinanceService {
           }
         }
 
+        const metricsClone: Record<string, SymbolTimeframeMetric> = {};
+        const storedMetrics = symbolMetricsStore.get(symbol) ?? {};
+        for (const [metricLabel, metricValue] of Object.entries(storedMetrics)) {
+          metricsClone[metricLabel] = { ...metricValue };
+        }
+
         aggregatedCandidates.set(symbol, {
           symbol,
           timeframe: label,
           entry,
           changes: symbolChanges,
           window: snapshotWindow,
+          metrics: metricsClone,
         });
       }
     }
@@ -725,6 +745,7 @@ export class BinanceService {
         flowRatio,
         flowLabel,
         atrPct,
+        atrValue: atr,
         flowImmediateBase,
         flowPersistence,
         windowStart: first.openTime,

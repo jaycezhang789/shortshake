@@ -78,6 +78,15 @@ export class TradingService {
     return Array.from(this.positions.keys());
   }
 
+  getPositionSummaries(): PositionSummary[] {
+    return Array.from(this.positions.values()).map((summary) => ({
+      symbol: summary.symbol,
+      net: summary.net,
+      long: summary.long,
+      short: summary.short,
+    }));
+  }
+
   getRemainingSlots(): number {
     return Math.max(0, MAX_POSITIONS - this.positions.size);
   }
@@ -142,6 +151,7 @@ export class TradingService {
   async createMarketOrder(
     symbol: string,
     direction: 'LONG' | 'SHORT',
+    options?: { sizeScale?: number },
   ): Promise<any | null> {
     if (!this.isTradingEnabled) {
       this.logger.warn('Trading disabled. Order cancelled.');
@@ -165,7 +175,8 @@ export class TradingService {
     const filters = await this.getSymbolFilters(symbol);
     await this.ensureSymbolConfiguration(symbol);
 
-    const margin = this.totalWalletBalance / 5;
+    const sizeScale = this.normalizeSizeScale(options?.sizeScale ?? 1);
+    const margin = (this.totalWalletBalance / 5) * sizeScale;
     if (margin <= 0) {
       this.logger.warn('Insufficient wallet balance to allocate margin.');
       return null;
@@ -223,6 +234,53 @@ export class TradingService {
     } catch (error) {
       this.logger.error(
         `Order placement failed for ${symbol}: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  async placeStopLoss(
+    symbol: string,
+    direction: 'LONG' | 'SHORT',
+    quantity: number,
+    stopPrice: number,
+  ): Promise<any | null> {
+    if (!this.isTradingEnabled) {
+      return null;
+    }
+
+    try {
+      const filters = await this.getSymbolFilters(symbol);
+      const formattedQty = this.formatQuantity(
+        quantity,
+        filters.quantityPrecision,
+      );
+      const formattedStop = this.formatPrice(stopPrice, filters.pricePrecision);
+      const side = direction === 'LONG' ? 'SELL' : 'BUY';
+
+      const response = await this.signedRequest(
+        'POST',
+        '/fapi/v1/order',
+        {
+          symbol,
+          side,
+          positionSide: direction,
+          type: 'STOP_MARKET',
+          stopPrice: formattedStop,
+          quantity: formattedQty,
+          timeInForce: 'GTC',
+          workingType: 'CONTRACT_PRICE',
+          reduceOnly: 'true',
+        },
+      );
+
+      this.logger.log(
+        `Placed stop loss for ${symbol} @ ${formattedStop}.`,
+      );
+      return response;
+    } catch (error) {
+      this.logger.error(
+        `Failed to place stop for ${symbol}: ${(error as Error).message}`,
       );
       return null;
     }
@@ -472,6 +530,77 @@ export class TradingService {
 
   private formatQuantity(quantity: number, precision: number): string {
     return quantity.toFixed(precision);
+  }
+
+  private formatPrice(price: number, precision: number): string {
+    return price.toFixed(precision);
+  }
+
+  private normalizeSizeScale(value: number): number {
+    if (!Number.isFinite(value)) {
+      return 1;
+    }
+    return Math.min(Math.max(value, 0.1), 1);
+  }
+
+  async flattenResidualPositions(threshold = 0.001): Promise<void> {
+    if (!this.isTradingEnabled) {
+      return;
+    }
+
+    for (const summary of this.positions.values()) {
+      const symbol = summary.symbol;
+
+      const longQty = Math.abs(summary.long ?? 0);
+      if (longQty > 0 && longQty < threshold) {
+        await this.submitReduceOnlyOrder(symbol, 'LONG', longQty);
+      }
+
+      const shortQty = Math.abs(summary.short ?? 0);
+      if (shortQty > 0 && shortQty < threshold) {
+        await this.submitReduceOnlyOrder(symbol, 'SHORT', shortQty);
+      }
+    }
+  }
+
+  private async submitReduceOnlyOrder(
+    symbol: string,
+    positionSide: 'LONG' | 'SHORT',
+    quantity: number,
+  ): Promise<void> {
+    try {
+      const filters = await this.getSymbolFilters(symbol);
+      const adjusted = this.applyStepSize(quantity, filters.stepSize);
+      if (adjusted <= 0) {
+        this.logger.debug(
+          `Residual position for ${symbol} below step size, skipping cleanup.`,
+        );
+        return;
+      }
+
+      const formattedQty = this.formatQuantity(
+        adjusted,
+        filters.quantityPrecision,
+      );
+      const side = positionSide === 'LONG' ? 'SELL' : 'BUY';
+
+      await this.signedRequest('POST', '/fapi/v1/order', {
+        symbol,
+        side,
+        positionSide,
+        type: 'MARKET',
+        quantity: formattedQty,
+        reduceOnly: 'true',
+      });
+
+      this.logger.log(
+        `Flattened residual ${positionSide} position for ${symbol}, qty ${formattedQty}.`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to flatten residual ${positionSide} position for ${symbol}: ${(error as Error).message}`,
+      );
+    }
   }
 
   private async signedRequest<T>(

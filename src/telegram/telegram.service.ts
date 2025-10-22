@@ -44,6 +44,40 @@ export class TelegramService {
     }
   }
 
+  async sendWalletSummary(
+    balance: number,
+    available: number,
+    positions: Array<{ symbol: string; net: number; long?: number; short?: number }>,
+  ): Promise<void> {
+    if (!this.client || !this.chatId) {
+      return;
+    }
+
+    const timestamp = new Date();
+    const header = `账户快照 ${timestamp.toISOString()}`;
+    const lines: string[] = [
+      header,
+      `总权益: ${balance.toFixed(2)} USDT`,
+      `可用余额: ${available.toFixed(2)} USDT`,
+      `持仓数量: ${positions.length}`,
+    ];
+
+    if (positions.length > 0) {
+      const positionLines = positions.map((position) => {
+        const longQty = position.long ?? 0;
+        const shortQty = position.short ?? 0;
+        return `${position.symbol} | 净仓 ${position.net.toFixed(4)} | 多 ${longQty.toFixed(4)} | 空 ${shortQty.toFixed(4)}`;
+      });
+      lines.push('持仓详情:');
+      lines.push(...positionLines.slice(0, 15));
+      if (positionLines.length > 15) {
+        lines.push(`... 其余 ${positionLines.length - 15} 条`);
+      }
+    }
+
+    await this.sendMessage(lines.join('\n'));
+  }
+
   private buildMessages(timestamp: Date, report: MoversResult): string[] {
     const header = `币安合约异动更新\n${timestamp.toISOString()}`;
     const messages = [header];
