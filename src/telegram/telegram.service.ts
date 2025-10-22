@@ -109,12 +109,14 @@ export class TelegramService {
       `趋势 ${this.formatScore(1 - scores.chop)}`,
       `动量 ${this.formatScore(scores.momentumAtr)}`,
       `同向 ${this.formatScore(scores.align)}`,
+      `多周期 ${this.formatScore(scores.mtfConsistency)}`,
       `门槛 ${this.formatScore(scores.gate)}`,
     ].join(' | ');
 
     const confirmation = [
       `量能 ${this.formatScore(scores.volumeBoost)}`,
-      `流向 ${this.formatScore(scores.flowBoost)}`,
+      `主动 ${this.formatScore(scores.flowActive)}`,
+      `持续 ${this.formatScore(scores.flowPersistence)}`,
     ].join(' | ');
 
     const extraTimeframes = this.buildAdditionalTimeframesLine(

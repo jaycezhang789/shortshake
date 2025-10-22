@@ -22,9 +22,11 @@ export const MOVERS_TIMEFRAMES = [
 const TOP_MOVERS = 10;
 const FLOW_BUY_THRESHOLD = 0.62;
 const FLOW_SELL_THRESHOLD = 0.38;
+const FLOW_SIGMA_K = 0.2;
 const MAX_SELECTED_SYMBOLS = 80;
 const CHG_SMALL = 0.01;
 const STATS_EPSILON = 1e-9;
+const FINAL_CORE_WEIGHT = 0.67;
 
 interface Candle {
   openTime: number;
@@ -60,9 +62,11 @@ export interface MoversEntry {
     chop: number;
     momentumAtr: number;
     align: number;
+    mtfConsistency: number;
     gate: number;
     volumeBoost: number;
-    flowBoost: number;
+    flowActive: number;
+    flowPersistence: number;
   };
 }
 
@@ -78,10 +82,14 @@ interface SymbolTimeframeMetric {
   flowLabel?: string;
   align?: number;
   volumeBoost?: number;
-  flowBoost?: number;
+  flowImmediateBase?: number;
+  flowPersistence?: number;
+  mtfConsistency?: number;
+  activeFlow?: number;
   confirmScore?: number;
   coreScore?: number;
   finalScore?: number;
+  atrPct: number;
 }
 
 @Injectable()
@@ -190,6 +198,7 @@ export class BinanceService {
 
     for (const symbolData of symbolDataList) {
       this.applyAlignment(symbolData.metrics);
+      this.applyMultiTimeframeConsistency(symbolData.metrics);
     }
 
     const metricsByTimeframe: Record<string, MoversEntry[]> = {};
@@ -214,28 +223,44 @@ export class BinanceService {
             ? (metric.totalQuoteVolume - volStats.mean) / volStats.std
             : 0;
         const volBoost = this.sigmoid(this.clamp(volZ, -3, 3));
-        const flowBoost =
-          metric.flowRatio !== undefined
-            ? this.clamp((metric.flowRatio - 0.5) / 0.12 + 0.5, 0, 1)
-            : 0.5;
+        const gVol = this.computeVolumeScaler(volZ);
+        const activeFlow = this.clamp(
+          (metric.flowImmediateBase ?? 0.5) * gVol,
+          0,
+          1,
+        );
+        const flowPersistence = this.clamp(metric.flowPersistence ?? 0, 0, 1);
+        const mtfConsistency = this.clamp(metric.mtfConsistency ?? 0.5, 0, 1);
+        const align = this.clamp(metric.align ?? 0.5, 0, 1);
 
-        const align = metric.align ?? 0.5;
-        const coreComponents = [
-          metric.efficiency,
-          1 - metric.chop,
-          metric.momentumAtr,
-          align,
-        ];
-        const coreScore = metric.smallMoveGate * this.average(coreComponents);
-        const confirmScore = this.average([volBoost, flowBoost]);
+        const coreScore =
+          metric.smallMoveGate *
+          this.weightedAverage([
+            { value: metric.efficiency, weight: 1 },
+            { value: 1 - metric.chop, weight: 1 },
+            { value: metric.momentumAtr, weight: 1 },
+            { value: align, weight: 1 },
+            { value: mtfConsistency, weight: 0.8 },
+          ]);
+
+        const confirmScore = this.weightedAverage([
+          { value: volBoost, weight: 0.5 },
+          { value: activeFlow, weight: 0.3 },
+          { value: flowPersistence, weight: 0.2 },
+        ]);
+
         const finalScore = this.clamp(
-          coreScore * 0.7 + confirmScore * 0.3 - liqPenalty,
+          FINAL_CORE_WEIGHT * coreScore +
+            (1 - FINAL_CORE_WEIGHT) * confirmScore -
+            liqPenalty,
           0,
           1,
         );
 
         metric.volumeBoost = volBoost;
-        metric.flowBoost = flowBoost;
+        metric.activeFlow = activeFlow;
+        metric.flowPersistence = flowPersistence;
+        metric.mtfConsistency = mtfConsistency;
         metric.align = align;
         metric.coreScore = coreScore;
         metric.confirmScore = confirmScore;
@@ -261,9 +286,11 @@ export class BinanceService {
             chop: metric.chop,
             momentumAtr: metric.momentumAtr,
             align,
+            mtfConsistency,
             gate: metric.smallMoveGate,
             volumeBoost: volBoost,
-            flowBoost,
+            flowActive: activeFlow,
+            flowPersistence,
           },
         });
       }
@@ -525,6 +552,8 @@ export class BinanceService {
       let waste = 0;
       let prevClose = first.open;
       let trSum = 0;
+      const flowSeries: number[] = [];
+      const returnSeries: number[] = [];
 
       for (const candle of windowCandles) {
         const logReturn = Math.log(candle.close / candle.open);
@@ -536,6 +565,9 @@ export class BinanceService {
         const incremental = (candle.close - candle.open) / candle.open;
         if (Number.isFinite(incremental)) {
           incrementalSum += incremental;
+          returnSeries.push(incremental);
+        } else {
+          returnSeries.push(0);
         }
 
         const highLow = candle.high - candle.low;
@@ -545,6 +577,20 @@ export class BinanceService {
         if (Number.isFinite(tr)) {
           trSum += tr;
         }
+
+        let flowMinute = 0.5;
+        if (
+          Number.isFinite(candle.takerBuyQuoteVolume) &&
+          Number.isFinite(candle.quoteVolume) &&
+          candle.quoteVolume > 0
+        ) {
+          flowMinute = this.clamp(
+            candle.takerBuyQuoteVolume / candle.quoteVolume,
+            0,
+            1,
+          );
+        }
+        flowSeries.push(flowMinute);
 
         prevClose = candle.close;
       }
@@ -577,14 +623,15 @@ export class BinanceService {
         (sum, candle) => sum + candle.takerBuyQuoteVolume,
         0,
       );
-
-      let flowRatio: number | undefined;
-      let flowLabel: string | undefined;
-
-      if (totalQuoteVolume > 0 && Number.isFinite(totalTakerBuyQuote)) {
-        flowRatio = totalTakerBuyQuote / totalQuoteVolume;
-        flowLabel = this.classifyFlow(flowRatio);
-      }
+      const flowRatio =
+        totalQuoteVolume > 0 ? totalTakerBuyQuote / totalQuoteVolume : undefined;
+      const flowLabel =
+        flowRatio !== undefined ? this.classifyFlow(flowRatio) : undefined;
+      const flowImmediateBase =
+        flowRatio !== undefined
+          ? this.squashedTanh((flowRatio - 0.5) / FLOW_SIGMA_K)
+          : 0.5;
+      const flowPersistence = this.computeFlowPersistence(flowSeries, returnSeries);
 
       metrics[label] = {
         changePercent: net * 100,
@@ -596,6 +643,9 @@ export class BinanceService {
         totalQuoteVolume,
         flowRatio,
         flowLabel,
+        atrPct,
+        flowImmediateBase,
+        flowPersistence,
       };
     }
 
@@ -645,6 +695,61 @@ export class BinanceService {
       const normalized =
         (scoreSum + 0.5 * comparisons) / (1.5 * comparisons);
       metric.align = this.clamp(normalized, 0, 1);
+    }
+  }
+
+  private applyMultiTimeframeConsistency(
+    metrics: Record<string, SymbolTimeframeMetric>,
+  ): void {
+    const weightMap: Record<string, number> = {
+      '10m': 1,
+      '30m': 1,
+      '1h': 1.5,
+      '2h': 1.5,
+    };
+
+    for (const { label } of MOVERS_TIMEFRAMES) {
+      const currentMetric = metrics[label];
+      if (!currentMetric) {
+        continue;
+      }
+
+      let agreeWeighted = 0;
+      let weightTotal = 0;
+      const magnitudes: number[] = [];
+      const baseSign = Math.sign(currentMetric.netChange);
+
+      for (const { label: otherLabel } of MOVERS_TIMEFRAMES) {
+        if (otherLabel === label) {
+          continue;
+        }
+        const otherMetric = metrics[otherLabel];
+        if (!otherMetric) {
+          continue;
+        }
+        const weight = weightMap[otherLabel] ?? 1;
+        weightTotal += weight;
+
+        const otherSign = Math.sign(otherMetric.netChange);
+        if (baseSign !== 0 && baseSign === otherSign) {
+          agreeWeighted += weight;
+        }
+        magnitudes.push(this.clamp(otherMetric.momentumAtr ?? 0, 0, 1));
+      }
+
+      const agree =
+        weightTotal > 0 ? this.clamp(agreeWeighted / weightTotal, 0, 1) : 0.5;
+      const mag =
+        magnitudes.length > 0
+          ? this.clamp(
+              magnitudes.reduce((sum, value) => sum + value, 0) /
+                magnitudes.length,
+              0,
+              1,
+            )
+          : 0.5;
+
+      currentMetric.mtfConsistency = this.clamp(agree * mag, 0, 1);
     }
   }
 
@@ -712,6 +817,92 @@ export class BinanceService {
       return 0;
     }
     return filtered.reduce((sum, value) => sum + value, 0) / filtered.length;
+  }
+
+  private weightedAverage(
+    entries: Array<{ value: number | undefined; weight: number }>,
+  ): number {
+    let weightedSum = 0;
+    let weightTotal = 0;
+    for (const { value, weight } of entries) {
+      if (!Number.isFinite(value ?? NaN) || weight <= 0) {
+        continue;
+      }
+      weightedSum += (value ?? 0) * weight;
+      weightTotal += weight;
+    }
+    if (weightTotal <= 0) {
+      return 0;
+    }
+    return this.clamp(weightedSum / weightTotal, 0, 1);
+  }
+
+  private computeVolumeScaler(zScore: number): number {
+    const capped = this.clamp(zScore, 0, 3);
+    return this.clamp(capped / 3, 0, 1);
+  }
+
+  private squashedTanh(value: number): number {
+    return (Math.tanh(value) + 1) / 2;
+  }
+
+  private computeFlowPersistence(
+    flowRatios: number[],
+    returns: number[],
+  ): number {
+    const length = Math.min(flowRatios.length, returns.length);
+    if (length === 0) {
+      return 0;
+    }
+
+    const flowSlice = flowRatios.slice(-length);
+    const returnSlice = returns.slice(-length);
+    const flowZ = this.zNormalize(flowSlice);
+    const returnZ = this.zNormalize(returnSlice);
+    const corr = this.correlation(flowZ, returnZ);
+
+    let agreeCount = 0;
+    for (let i = 0; i < length; i += 1) {
+      const flowSign = Math.sign(flowSlice[i] - 0.5);
+      const returnSign = Math.sign(returnSlice[i]);
+      if (flowSign === 0 || returnSign === 0) {
+        continue;
+      }
+      if (flowSign === returnSign) {
+        agreeCount += 1;
+      }
+    }
+
+    const agreeRatio = length > 0 ? agreeCount / length : 0;
+    const persistence = ((corr + 1) / 2) * agreeRatio;
+    return this.clamp(persistence, 0, 1);
+  }
+
+  private zNormalize(series: number[]): number[] {
+    if (series.length === 0) {
+      return [];
+    }
+    const mean = series.reduce((sum, value) => sum + value, 0) / series.length;
+    const variance =
+      series.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+      Math.max(series.length - 1, 1);
+    const std = Math.sqrt(variance);
+    if (std <= STATS_EPSILON) {
+      return series.map(() => 0);
+    }
+    return series.map((value) => (value - mean) / std);
+  }
+
+  private correlation(a: number[], b: number[]): number {
+    const length = Math.min(a.length, b.length);
+    if (length === 0) {
+      return 0;
+    }
+    let sum = 0;
+    for (let i = 0; i < length; i += 1) {
+      sum += a[i] * b[i];
+    }
+    return this.clamp(sum / length, -1, 1);
   }
 
   private async requestWithRetry<T>(
