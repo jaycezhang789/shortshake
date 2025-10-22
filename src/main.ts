@@ -2,6 +2,7 @@ import { config as loadEnv } from 'dotenv';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { BinanceService } from './binance/binance.service';
+import { TelegramService } from './telegram/telegram.service';
 
 loadEnv();
 
@@ -10,6 +11,7 @@ async function bootstrap() {
   const intervalMinutes = Number(process.env.REFRESH_INTERVAL_MINUTES) || 10;
   const intervalMs = intervalMinutes * 60 * 1000;
   const binanceService = app.get(BinanceService);
+  const telegramService = app.get(TelegramService);
   let isRunning = false;
   let isShuttingDown = false;
 
@@ -26,6 +28,7 @@ async function bootstrap() {
       console.log(`\n[${new Date().toISOString()}] Refreshing movers data...`);
       const movers = await binanceService.getTopMovers();
       console.dir(movers, { depth: null });
+      await telegramService.sendMoversReport(movers);
     } catch (error) {
       console.error('Main process failed:', error);
     } finally {
