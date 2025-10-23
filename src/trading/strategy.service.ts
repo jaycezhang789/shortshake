@@ -76,6 +76,7 @@ export class StrategyService {
 
     this.syncPositionStates();
     await this.tradingService.flattenResidualPositions();
+    // 仅在周期刷新时进行分批和加仓的检查（不启用动态移动止损/时间止损）
     await this.updateManagedPositions(result);
 
     for (const candidate of result.aggregatedTop) {
@@ -90,7 +91,7 @@ export class StrategyService {
         );
       }
     }
-
+    // 再次根据最新指标进行一次检查
     await this.updateManagedPositions(result);
   }
 
@@ -118,7 +119,6 @@ export class StrategyService {
 
       state.totalQuantity = quantity;
       state.riskAmount = quantity * state.slDistance;
-      this.ensurePriceWatcher(state);
     }
   }
 
@@ -272,7 +272,6 @@ export class StrategyService {
     };
 
     this.managedPositions.set(candidate.symbol, state);
-    this.ensurePriceWatcher(state);
 
     this.logger.log(
       `Opened ${direction} on ${candidate.symbol} @ ${avgPrice.toFixed(
@@ -337,14 +336,8 @@ export class StrategyService {
     scores: { efficiency: number; volume: number; flow: number },
   ): boolean {
     const gate = metric.smallMoveGate ?? 0;
-    const momentumSign = Math.sign(metric.netChange ?? 0);
     const momentumMagnitude = metric.momentumAtr ?? 0;
-
-    const momentumTrigger =
-      gate >= 0.65 &&
-      momentumMagnitude >= 0.5 &&
-      ((direction === 'LONG' && momentumSign >= 0) ||
-        (direction === 'SHORT' && momentumSign <= 0));
+    const momentumTrigger = gate >= 0.65 && momentumMagnitude >= 0.5;
 
     const efficiencyTrigger =
       scores.efficiency >= 55 &&
@@ -407,6 +400,7 @@ export class StrategyService {
         continue;
       }
 
+      // 仅更新用于分批/加仓判定所需的状态（不做移动止损/时间止损）
       state.parentAtr = parentMetric.atrValue;
       state.childAtr = childMetric.atrValue;
       state.cleanScore =
@@ -420,33 +414,11 @@ export class StrategyService {
       state.parentMetricSnapshot = this.cloneMetric(parentMetric);
       state.childMetricSnapshot = this.cloneMetric(childMetric);
       state.lastPrice = currentPrice;
-      this.ensurePriceWatcher(state);
-
-      if (state.direction === 'LONG') {
-        state.highestPrice = Math.max(
-          state.highestPrice ?? state.entryPrice,
-          parentMetric.highestClose ?? currentPrice,
-          currentPrice,
-        );
-      } else {
-        state.lowestPrice = Math.min(
-          state.lowestPrice ?? state.entryPrice,
-          parentMetric.lowestClose ?? currentPrice,
-          currentPrice,
-        );
-      }
 
       const rMultiple = this.calculateRMultiple(state, currentPrice);
       state.maxR = Math.max(state.maxR, rMultiple);
 
-      await this.handleBreakEvenMove(state, childMetric, currentPrice);
-      if (!this.managedPositions.has(symbol)) {
-        continue;
-      }
-      await this.handleTrailingStop(state, parentMetric, childMetric, currentPrice);
-      if (!this.managedPositions.has(symbol)) {
-        continue;
-      }
+      // 仅启用：分批止盈、加仓
       await this.handlePartials(state, childMetric, currentPrice);
       if (!this.managedPositions.has(symbol)) {
         continue;
@@ -455,11 +427,6 @@ export class StrategyService {
       if (!this.managedPositions.has(symbol)) {
         continue;
       }
-      await this.handleTimeStop(state);
-      if (!this.managedPositions.has(symbol)) {
-        continue;
-      }
-      await this.handleStructureBreak(state, childMetric);
 
       if (state.totalQuantity <= 1e-6) {
         state.unsubscribePrice?.();
@@ -468,116 +435,15 @@ export class StrategyService {
     }
   }
 
-  private ensurePriceWatcher(state: ManagedPositionState): void {
-    if (state.totalQuantity <= 1e-6) {
-      state.unsubscribePrice?.();
-      state.unsubscribePrice = undefined;
-      return;
-    }
-    if (state.unsubscribePrice) {
-      return;
-    }
-    state.unsubscribePrice = this.tradingService.subscribePriceStream(
-      state.symbol,
-      (tick) => {
-        void this.handleLivePriceTick(state.symbol, tick);
-      },
-    );
+  private ensurePriceWatcher(_: ManagedPositionState): void {
+    // 实时价格订阅仅服务于移动止损与动态仓位调整，现已关闭。
   }
 
   private async handleLivePriceTick(
-    symbol: string,
-    tick: PriceTick,
+    _symbol: string,
+    _tick: PriceTick,
   ): Promise<void> {
-    const state = this.managedPositions.get(symbol);
-    if (!state || state.totalQuantity <= 1e-6) {
-      state?.unsubscribePrice?.();
-      return;
-    }
-
-    if (state.processingLiveUpdate) {
-      state.pendingLiveUpdate = tick;
-      return;
-    }
-
-    state.processingLiveUpdate = true;
-    state.pendingLiveUpdate = undefined;
-
-    try {
-      const parentMetricSnapshot = state.parentMetricSnapshot;
-      const childMetricSnapshot = state.childMetricSnapshot;
-      if (!parentMetricSnapshot || !childMetricSnapshot) {
-        return;
-      }
-
-      const currentPrice = tick.markPrice;
-      state.lastPrice = currentPrice;
-
-      if (state.direction === 'LONG') {
-        state.highestPrice = Math.max(
-          state.highestPrice ?? state.entryPrice,
-          currentPrice,
-        );
-      } else {
-        state.lowestPrice = Math.min(
-          state.lowestPrice ?? state.entryPrice,
-          currentPrice,
-        );
-      }
-
-      const liveParentMetric = this.withLivePrice(parentMetricSnapshot, currentPrice);
-      const liveChildMetric = this.withLivePrice(childMetricSnapshot, currentPrice);
-
-      const rMultiple = this.calculateRMultiple(state, currentPrice);
-      state.maxR = Math.max(state.maxR, rMultiple);
-
-      await this.handleBreakEvenMove(state, liveChildMetric, currentPrice);
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      await this.handleTrailingStop(
-        state,
-        liveParentMetric,
-        liveChildMetric,
-        currentPrice,
-      );
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      await this.handlePartials(state, liveChildMetric, currentPrice);
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      await this.handleAdds(state, liveChildMetric, currentPrice);
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      await this.handleTimeStop(state);
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      await this.handleStructureBreak(state, liveChildMetric);
-      if (!this.managedPositions.has(symbol)) {
-        return;
-      }
-
-      if (state.totalQuantity <= 1e-6) {
-        state.unsubscribePrice?.();
-        this.managedPositions.delete(symbol);
-      }
-    } finally {
-      state.processingLiveUpdate = false;
-      const pending = state.pendingLiveUpdate;
-      state.pendingLiveUpdate = undefined;
-      if (pending) {
-        void this.handleLivePriceTick(symbol, pending);
-      }
-    }
+    // 实时价格回调仅服务于移动止损与动态仓位调整，现已关闭。
   }
 
   private calculateRMultiple(
@@ -597,69 +463,21 @@ export class StrategyService {
     childMetric: SymbolTimeframeMetric,
     currentPrice: number,
   ): Promise<void> {
-    if (state.beMoved || state.slDistance <= 0) {
-      return;
-    }
-
-    const childScores = this.computeScores(childMetric);
-    const threshold =
-      childScores.volume >= 55 && childScores.flow >= 55 ? 1 : 1.3;
-
-    if (state.maxR < threshold) {
-      return;
-    }
-
-    const dirSign = state.direction === 'LONG' ? 1 : -1;
-    let newStop = state.entryPrice;
-    if (state.direction === 'LONG') {
-      newStop = Math.min(newStop, currentPrice - 0.0005 * currentPrice);
-    } else {
-      newStop = Math.max(newStop, currentPrice + 0.0005 * currentPrice);
-    }
-
-    await this.tradingService.replaceStopLoss(
-      state.symbol,
-      state.direction,
-      state.totalQuantity,
-      newStop,
-    );
-
-    state.stopPrice = newStop;
-    state.slDistance = Math.abs(newStop - state.entryPrice);
-    state.beMoved = true;
-    state.riskAmount = state.totalQuantity * state.slDistance;
+    // 动态移动止损已禁用
+    void state;
+    void childMetric;
+    void currentPrice;
+    return;
   }
 
   private async moveStopToBreakEven(
     state: ManagedPositionState,
     currentPrice: number,
   ): Promise<void> {
-    if (
-      state.beMoved ||
-      state.slDistance <= 0 ||
-      state.totalQuantity <= 1e-6
-    ) {
-      return;
-    }
-
-    let newStop = state.entryPrice;
-    if (state.direction === 'LONG') {
-      newStop = Math.min(newStop, currentPrice - 0.0005 * currentPrice);
-    } else {
-      newStop = Math.max(newStop, currentPrice + 0.0005 * currentPrice);
-    }
-
-    await this.tradingService.replaceStopLoss(
-      state.symbol,
-      state.direction,
-      state.totalQuantity,
-      newStop,
-    );
-
-    state.stopPrice = newStop;
-    state.slDistance = Math.abs(newStop - state.entryPrice);
-    state.beMoved = true;
-    state.riskAmount = state.totalQuantity * state.slDistance;
+    // 动态移动止损已禁用
+    void state;
+    void currentPrice;
+    return;
   }
 
   private async handleTrailingStop(
@@ -668,58 +486,12 @@ export class StrategyService {
     childMetric: SymbolTimeframeMetric,
     currentPrice: number,
   ): Promise<void> {
-    const parentAtr = parentMetric.atrValue;
-    if (!parentAtr || parentAtr <= 0) {
-      return;
-    }
-
-    let trailMultiple = this.computeTrailAtr(state.cleanScore, state.gateScore);
-    if (
-      this.isDegrading(childMetric.efficiencyHistory ?? []) ||
-      this.isMomentumTurning(childMetric.momentumHistory ?? [])
-    ) {
-      trailMultiple = Math.max(1.6, trailMultiple - 0.4);
-    }
-
-    state.trailAtrMultiple = trailMultiple;
-    const referenceHigh = Math.max(
-      parentMetric.highestClose ?? currentPrice,
-      state.highestPrice ?? currentPrice,
-    );
-    const referenceLow = Math.min(
-      parentMetric.lowestClose ?? currentPrice,
-      state.lowestPrice ?? currentPrice,
-    );
-
-    if (state.direction === 'LONG') {
-      const newTrail = referenceHigh - trailMultiple * parentAtr;
-      if (newTrail > (state.trailPrice ?? state.stopPrice) && newTrail < currentPrice) {
-        state.trailPrice = newTrail;
-        await this.tradingService.replaceStopLoss(
-          state.symbol,
-          state.direction,
-          state.totalQuantity,
-          newTrail,
-        );
-        state.stopPrice = newTrail;
-        state.slDistance = Math.abs(newTrail - state.entryPrice);
-        state.riskAmount = state.totalQuantity * state.slDistance;
-      }
-    } else {
-      const newTrail = referenceLow + trailMultiple * parentAtr;
-      if (newTrail < (state.trailPrice ?? state.stopPrice) && newTrail > currentPrice) {
-        state.trailPrice = newTrail;
-        await this.tradingService.replaceStopLoss(
-          state.symbol,
-          state.direction,
-          state.totalQuantity,
-          newTrail,
-        );
-        state.stopPrice = newTrail;
-        state.slDistance = Math.abs(newTrail - state.entryPrice);
-        state.riskAmount = state.totalQuantity * state.slDistance;
-      }
-    }
+    // 动态移动止损已禁用
+    void state;
+    void parentMetric;
+    void childMetric;
+    void currentPrice;
+    return;
   }
 
   private async handlePartials(
@@ -739,17 +511,14 @@ export class StrategyService {
 
     if (!state.partialOneTaken) {
       const triggeredCleanTrend = cleanTrend && rMultiple >= 2;
-      const triggeredGeneral =
-        !cleanTrend && !strongVolume && rMultiple >= 1.5;
+      const triggeredGeneral = !cleanTrend && !strongVolume && rMultiple >= 1.5;
       if (triggeredCleanTrend || triggeredGeneral) {
         await this.executePartial(state, partialQty);
         if (!this.managedPositions.has(state.symbol)) {
           return;
         }
         state.partialOneTaken = true;
-        if (triggeredGeneral) {
-          await this.moveStopToBreakEven(state, currentPrice);
-        }
+        // 不再调用 moveStopToBreakEven，避免动态移动止损
       }
     }
 
@@ -778,6 +547,7 @@ export class StrategyService {
       return;
     }
 
+    // 重新挂同价止损，数量按剩余头寸调整（不改变止损价）
     await this.tradingService.replaceStopLoss(
       state.symbol,
       state.direction,
@@ -792,7 +562,8 @@ export class StrategyService {
     childMetric: SymbolTimeframeMetric,
     currentPrice: number,
   ): Promise<void> {
-    if (state.addCount >= 2 || !state.beMoved) {
+    // 允许加仓：不再依赖 beMoved（保本），仅保留次数与评分阈值限制
+    if (state.addCount >= 2) {
       return;
     }
 
@@ -831,6 +602,7 @@ export class StrategyService {
     );
     state.totalQuantity += quantity;
     state.addCount += 1;
+    // 重新挂同价止损，数量按新增后头寸调整（不改变止损价）
     await this.tradingService.replaceStopLoss(
       state.symbol,
       state.direction,
@@ -841,71 +613,19 @@ export class StrategyService {
   }
 
   private async handleTimeStop(state: ManagedPositionState): Promise<void> {
-    const childMinutes = state.childMinutes || 10;
-    const parentMinutes = state.parentMinutes || 30;
-    const thresholdCandles = Math.max(1, Math.ceil(3 * (parentMinutes / childMinutes)));
-    const elapsedCandles = Math.floor(
-      (Date.now() - state.openedAt) / (childMinutes * 60_000),
-    );
-
-    if (state.timeStopStage === 0 && elapsedCandles >= thresholdCandles) {
-      if (state.maxR < 0.5) {
-        const dirSign = state.direction === 'LONG' ? 1 : -1;
-        const targetStop =
-          state.entryPrice - dirSign * 0.5 * state.initialSlDistance;
-        await this.tradingService.replaceStopLoss(
-          state.symbol,
-          state.direction,
-          state.totalQuantity,
-          targetStop,
-        );
-        state.stopPrice = targetStop;
-        state.slDistance = Math.abs(targetStop - state.entryPrice);
-        state.riskAmount = state.totalQuantity * state.slDistance;
-      }
-      state.timeStopStage = 1;
-      state.timeStopTimestamp = Date.now();
-    } else if (
-      state.timeStopStage === 1 &&
-      state.timeStopTimestamp &&
-      Date.now() - state.timeStopTimestamp >= thresholdCandles * childMinutes * 60_000 &&
-      state.maxR < 0.5
-    ) {
-      await this.closePosition(state, 'Time stop');
-    }
+    // 时间止损已禁用
+    void state;
+    return;
   }
 
   private async handleStructureBreak(
     state: ManagedPositionState,
     childMetric: SymbolTimeframeMetric,
   ): Promise<void> {
-    const trailBase = state.trailPrice ?? state.stopPrice;
-    const atrChild = childMetric.atrValue ?? state.childAtr ?? 0;
-    if (!trailBase || atrChild <= 0) {
-      return;
-    }
-
-    const closes = childMetric.closeHistory ?? [];
-    if (closes.length < 2) {
-      return;
-    }
-
-    const threshold =
-      trailBase + (state.direction === 'LONG' ? 1 : -1) * 0.3 * atrChild;
-    const recent = closes.slice(-2);
-    const breach = recent.every((close) =>
-      state.direction === 'LONG' ? close <= threshold : close >= threshold,
-    );
-
-    if (breach) {
-      state.structureBreakCounter += 1;
-    } else {
-      state.structureBreakCounter = 0;
-    }
-
-    if (state.structureBreakCounter >= 2) {
-      await this.closePosition(state, 'Structure break');
-    }
+    // 结构性止损已禁用
+    void state;
+    void childMetric;
+    return;
   }
 
   private async closePosition(
